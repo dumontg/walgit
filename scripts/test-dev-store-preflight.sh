@@ -24,10 +24,10 @@ export HEALTH_STATUS=1 BUSY=false
 bash "$root/scripts/dev-store-preflight.sh"
 export BUSY=true
 if bash "$root/scripts/dev-store-preflight.sh" > "$scratch/error" 2>&1; then exit 1; fi
-rg -q 'Port 19100 is occupied' "$scratch/error"
+[[ "$(< "$scratch/error")" == *'Port 19100 is occupied'* ]]
 for invalid in 0 65536 019100 nope; do
     if WALGIT_DEV_STORE_PORT="$invalid" bash "$root/scripts/dev-store-preflight.sh" >/dev/null 2>&1; then exit 1; fi
 done
 if WALGIT_DEV_CONSOLE_PORT=19100 bash "$root/scripts/dev-store-preflight.sh" >/dev/null 2>&1; then exit 1; fi
-rg -q 'http://127.0.0.1:19100/minio/health/live' "$CALLS"
+[[ "$(< "$CALLS")" == *'http://127.0.0.1:19100/minio/health/live'* ]]
 echo 'PASS healthy repeat start, free/occupied alternate ports and invalid settings'
