@@ -55,6 +55,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Manifest CAS answered 412 | the same evidence check before dropping the own segment: a 412 is contention, or a client library retrying a write that already landed (S3 SDK standard mode, GCS uploads with a precondition) | +1 manifest GET on the 412 path only (+1 log GET when our descriptor is listed); successful publishes unchanged | `publish.rs::process_batch`, `publish_compact_classified`, `publish_settings_impl` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Repository create (`PUT /{o}/{r}`, `walgit repo create`, auto-create on push) | 1 manifest Create PUT; its 412 *is* "exists" (409), whether this instance holds a handle or not; auto-create's lost race adds the open it would have done anyway | 1 (was 0 for a warm handle, which answered 201 for an existing repository) | `registry.rs::create`, `open_or_create` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Azure store read / PUT at or below `multipart_threshold` (any body kind) / HEAD / successful DELETE | 1 | 1; GET streams without SDK partitioning or an extra HEAD; a small file or stream is read into memory rather than staged | `walgit-store/src/azure.rs` |
@@ -69,7 +70,8 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Configured store retries (failure path only) | healthy calls remain one attempt; transient idempotent GCS/S3 reads and interrupted bulk reads retry with jitter; writes and deletes are always single-attempt | up to `store.max_retries` extra read attempts; no new healthy-path requests or CAS objects | `gcs.rs`, `s3.rs` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
-counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
+counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, checkpoint **4**, and create of an
+existing repository **1** (warm and cold). Cold open used to spend an
 extra unconditional manifest GET (3 requests, 3 sequential rounds); it now applies the manifest it already
 fetched directly (2 requests, 2 rounds). `claim_log_slot`, `cas_landed`, and `put_immutable_create` add probes
 only after Create/CAS failure, so the measured happy-path counts remain unchanged.
