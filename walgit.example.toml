@@ -64,7 +64,7 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "azure" | "memory" (tests)
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket
 max_retries = 8                   # retries on retryable store errors (jittered backoff)
@@ -77,6 +77,14 @@ region = "us-east-1"
 access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = false          # true for most self-hosted S3 implementations
+
+[store.azure]                     # bucket = the container
+auth = "shared_key"               # "shared_key" | "workload_identity"
+connection_string_env = "AZURE_STORAGE_CONNECTION_STRING" # shared_key: env var with AccountName, AccountKey (+ BlobEndpoint for Azurite)
+account = ""                      # workload_identity: the storage account name (required)
+endpoint = ""                     # workload_identity: blob endpoint; empty = https://<account>.blob.core.windows.net
+                                  # workload_identity reads AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and
+                                  # AZURE_AUTHORITY_HOST (as injected by AKS); the identity needs Storage Blob Data Contributor
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials

@@ -235,6 +235,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -247,6 +248,8 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    /// Azure Blob Storage; `bucket` is the container.
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -285,6 +288,33 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    pub auth: AzureAuth,
+    /// `shared_key`: env var holding the storage account connection string (`AccountName`,
+    /// `AccountKey`, and `BlobEndpoint` for Azurite or a custom endpoint). Read at startup.
+    pub connection_string_env: String,
+    /// `workload_identity`: the storage account name.
+    pub account: String,
+    /// `workload_identity`: the blob endpoint; empty means
+    /// `https://<account>.blob.core.windows.net`.
+    pub endpoint: String,
+}
+
+/// How walgit authenticates to the storage account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureAuth {
+    /// The account key from a connection string signs every request.
+    #[default]
+    SharedKey,
+    /// Microsoft Entra tokens for the pod's federated identity (AKS Workload Identity):
+    /// `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and
+    /// `AZURE_AUTHORITY_HOST`, as the AKS webhook injects them.
+    WorkloadIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -842,6 +872,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -867,6 +898,16 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+        }
+    }
+}
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            auth: AzureAuth::SharedKey,
+            connection_string_env: "AZURE_STORAGE_CONNECTION_STRING".into(),
+            account: String::new(),
+            endpoint: String::new(),
         }
     }
 }
@@ -1088,6 +1129,12 @@ impl Config {
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        anyhow::ensure!(
+            self.store.backend != StoreBackend::Azure
+                || self.store.azure.auth != AzureAuth::WorkloadIdentity
+                || !self.store.azure.account.is_empty(),
+            "store.azure.account must be set with auth = workload_identity"
+        );
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1436,6 +1483,16 @@ mod tests {
         c.apply_env(vec![("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string())].into_iter())
             .unwrap();
         assert_eq!(c.placement.serve_exclude, vec!["acme/monorepo"]);
+    }
+
+    #[test]
+    fn azure_workload_identity_needs_an_account() {
+        let base = "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\nauth = \"workload_identity\"\n";
+        let err = Config::parse(base).unwrap_err();
+        assert!(err.to_string().contains("store.azure.account"), "{err}");
+        let c = Config::parse(&format!("{base}account = \"acct\"\n")).unwrap();
+        assert_eq!(c.store.azure.auth, AzureAuth::WorkloadIdentity);
+        assert_eq!(c.store.azure.account, "acct");
     }
 
     /// You cannot maintain what you refuse to serve.

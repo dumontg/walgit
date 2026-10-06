@@ -16,6 +16,8 @@ use bytes::Bytes;
 use futures::Stream;
 use tracing::Instrument;
 
+#[cfg(feature = "azure")]
+pub mod azure;
 pub mod coord;
 pub use coord::CoordError;
 pub mod fault;
@@ -641,6 +643,16 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
             #[cfg(not(feature = "s3"))]
             {
                 anyhow::bail!("s3 backend requires the `s3` feature")
+            }
+        }
+        walgit_config::StoreBackend::Azure => {
+            #[cfg(feature = "azure")]
+            {
+                Arc::new(azure::AzureStore::new(&cfg.store)?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!("azure backend requires the `azure` feature")
             }
         }
         walgit_config::StoreBackend::Gcs => {

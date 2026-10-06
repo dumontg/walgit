@@ -82,7 +82,7 @@ Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, geometric compaction, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Manual `compact --base` rebuilds the base on a host with sufficient disk. |
 | **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
-| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; an in-memory store for tests. |
+| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …), GCS and Azure Blob Storage, first class; an in-memory store for tests. |
 
 ## How it works, briefly
 

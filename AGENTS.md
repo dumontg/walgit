@@ -487,6 +487,14 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-10-06): Azure Blob Storage is a store backend.** `azure` (`walgit-store/src/azure.rs`) speaks
+  the Blob REST API, authenticated with the account's shared key or with AKS Workload Identity (the pod's
+  federated token exchanged for a Microsoft Entra token, cached until 5 minutes before expiry). CAS is
+  `If-Match`/`If-None-Match`, conditional delete is native, and large objects go up as blocks committed by one
+  conditional `Put Block List` (a large `Create` is atomic, unlike S3). No compose: `publish` uploads whole.
+  Every request has connect and read timeouts; a full store stall still lasts minutes for a client, because
+  the retries above the store multiply them. Contract suite against Azurite.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
@@ -506,8 +514,9 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
-- **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
+- **S3, GCS and Azure are first class.** Every store feature has an implementation in each and runs in the contract
+  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`, `just test-azure` against Azurite); "GCS only" is
+  a bug. Compose is the exception: optional by design, absent on Azure (D50).
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Exercise
   ordinary clone/fetch and bounded maintenance against the rig before testing on large repositories.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full
