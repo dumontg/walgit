@@ -32,6 +32,7 @@ async fn verifies_real_multi_pack_bitmap_and_rejects_missing_or_corrupt_bytes() 
                         fsck: true,
                         thin: false,
                         max_bytes: None,
+                        limits: None,
                     },
                 )
                 .await

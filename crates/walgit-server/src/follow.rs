@@ -358,6 +358,7 @@ pub(crate) async fn op(
                         fsck: cfg.wal.fsck_objects,
                         max_bytes: None,
                         thin: false,
+                        limits: None,
                     },
                 )
                 .await

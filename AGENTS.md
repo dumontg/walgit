@@ -495,6 +495,15 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   Every request has connect and read timeouts; a full store stall still lasts minutes for a client, because
   the retries above the store multiply them. Contract suite against Azurite.
 
+- **D51 (2026-10-06): Pushed packs are held to object and inflation limits before `index-pack` reads
+  them.** `git index-pack` inflates whatever entry headers declare and holds objects while it resolves deltas,
+  so an 82 KiB push of deltas could cost a gigabyte. The guard (`walgit-git/src/pack_guard.rs`) inflates each
+  stream into a scratch buffer on a blocking thread, a few chunks behind the spool to disk, and refuses an
+  entry declaring more than `max_object_bytes`, a delta building more, a stream inflating past its header, or a
+  pack adding up to more than `max_push_inflated_bytes`; the push answers `unpack <reason>`. Cost: every pushed
+  object is inflated twice (guard, then index-pack), in parallel with receiving. Git requests outside pack data
+  (upload-pack requests, push commands) are held to `max_command_bytes` once gzip is decoded.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

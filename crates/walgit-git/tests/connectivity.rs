@@ -23,6 +23,7 @@ async fn setup() -> (tempfile::TempDir, LocalRepo, String, String) {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -91,6 +92,7 @@ async fn connectivity_annotated_tag_tip_after_commits_exist() {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -120,6 +122,7 @@ async fn connectivity_annotated_tag_tip_after_commits_exist() {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -139,6 +142,7 @@ async fn connectivity_annotated_tag_tip_after_commits_exist() {
             fsck: false,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -191,6 +195,7 @@ async fn connectivity_tolerates_gitlinks() {
             fsck: false,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await

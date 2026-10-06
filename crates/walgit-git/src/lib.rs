@@ -8,6 +8,7 @@ pub mod maintenance_input;
 pub mod midx;
 pub mod object_links;
 pub mod pack_groups;
+pub mod pack_guard;
 pub mod pack_segments;
 pub mod packfile_uri;
 pub mod pkt;
@@ -284,6 +285,20 @@ pub struct IngestOptions {
     pub fsck: bool,
     pub max_bytes: Option<u64>,
     pub thin: bool,
+    /// Object and inflation limits checked while the pack is received (see
+    /// [`pack_guard`]); `None` for packs this host produced or fetched itself.
+    pub limits: Option<pack_guard::PackLimits>,
+}
+
+/// The pack guard's verdict, as the error ingest reports.
+async fn guard_outcome(
+    task: tokio::task::JoinHandle<Result<(), pack_guard::PackRefused>>,
+) -> Result<(), GitError> {
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(refused)) => Err(GitError::InvalidInput(refused.0)),
+        Err(e) => Err(GitError::Io(std::io::Error::other(e))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -803,6 +818,20 @@ impl LocalRepo {
         let mut total: u64 = 0;
         let mut buf = vec![0u8; 64 * 1024];
         let mut empty_check = true;
+        // The pack guard inflates on a blocking thread, a few chunks behind the copy; it
+        // stops reading as soon as it refuses the pack, which fails the next send.
+        let mut guard = opts.limits.map(|limits| {
+            let hash_len = self.object_format().kind().len_in_bytes();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+            let task = tokio::task::spawn_blocking(move || {
+                let mut guard = pack_guard::PackGuard::new(limits, hash_len);
+                while let Some(chunk) = rx.blocking_recv() {
+                    guard.feed(&chunk)?;
+                }
+                guard.finish()
+            });
+            (tx, task)
+        });
         loop {
             let n = pack
                 .read(&mut buf)
@@ -814,6 +843,25 @@ impl LocalRepo {
             }
             empty_check = false;
             total += n as u64;
+            if let Some((tx, _)) = &guard {
+                let chunk = bytes::Bytes::copy_from_slice(buf.get(..n).unwrap_or_default());
+                if tx.send(chunk).await.is_err() {
+                    let refused = match guard.take() {
+                        Some((tx, task)) => {
+                            drop(tx);
+                            guard_outcome(task).await
+                        }
+                        None => Ok(()),
+                    };
+                    drop(
+                        tokio::fs::remove_file(&tmp_path)
+                            .instrument(span.clone())
+                            .await,
+                    );
+                    refused?;
+                    return Err(GitError::InvalidInput("pack check stopped".into()));
+                }
+            }
             if let Some(max) = opts.max_bytes
                 && total > max
             {
@@ -843,6 +891,17 @@ impl LocalRepo {
             .await
             .map_err(GitError::Io)?;
         drop(tmp);
+        if let Some((tx, task)) = guard.take() {
+            drop(tx);
+            if let Err(e) = guard_outcome(task).await {
+                drop(
+                    tokio::fs::remove_file(&tmp_path)
+                        .instrument(span.clone())
+                        .await,
+                );
+                return Err(e);
+            }
+        }
         span.record("bytes", total);
         if empty_check {
             let _ = tokio::fs::remove_file(&tmp_path)

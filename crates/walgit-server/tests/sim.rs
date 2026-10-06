@@ -408,6 +408,7 @@ impl Pusher {
                     fsck: false,
                     max_bytes: None,
                     thin: false,
+                    limits: None,
                 },
             ),
         )
@@ -2174,6 +2175,7 @@ async fn run_task_ownership(seed: u64) -> Result<()> {
                     fsck: false,
                     max_bytes: None,
                     thin: true,
+                    limits: None,
                 },
             )
             .await?
@@ -2349,6 +2351,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
                     fsck: false,
                     max_bytes: None,
                     thin: false,
+                    limits: None,
                 },
             )
             .await?
@@ -2382,6 +2385,7 @@ async fn run_cache_pressure(seed: u64) -> Result<()> {
                     fsck: false,
                     max_bytes: None,
                     thin: false,
+                    limits: None,
                 },
             )
             .await?

@@ -212,6 +212,7 @@ pub async fn run(
                 fsck: cfg.wal.fsck_objects,
                 max_bytes: Some(cfg.server.max_push_bytes.as_u64()),
                 thin: false,
+                limits: None,
             },
         )
         .await?;

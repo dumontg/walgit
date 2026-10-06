@@ -179,7 +179,12 @@ pub async fn upload_pack(
     let enc = headers
         .get(axum::http::header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
-    let reader = maybe_gunzip(enc, body_to_async_read(body));
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+        Box::new(crate::stream::LimitedReader::new(
+            maybe_gunzip(enc, body_to_async_read(body)),
+            st.cfg.server.max_command_bytes.as_u64(),
+            "upload-pack request",
+        ));
 
     // sync() is deferred to each handler path so the ReadGuard lives for the
     // entire streaming response (packs must not be removed mid-clone).
@@ -883,12 +888,20 @@ pub async fn receive_pack(
     let enc = headers
         .get(axum::http::header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
-    let reader = maybe_gunzip(enc, body_to_async_read(body));
+    // The ref updates are held to `max_command_bytes`; the pack after them is bounded by
+    // ingest (`max_push_bytes`, and the pack guard's object and inflation limits).
+    let reader = crate::stream::LimitedReader::new(
+        maybe_gunzip(enc, body_to_async_read(body)),
+        st.cfg.server.max_command_bytes.as_u64(),
+        "push commands",
+    );
+    let command_limit = reader.limit();
 
     // Parse commands + capabilities first (they need no objects); pack bytes
     // follow in `pack_reader`. Knowing the capabilities before the sync lets
     // us narrate the sync on band 2 when the client speaks side-band-64k.
     let (txn, caps, pack_reader) = walgit_git::receive::parse(reader).await.map_err(git_err)?;
+    command_limit.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     let pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(pack_reader);
     // Wal's verify_txn treats empty string as the zero oid (create/delete).
     // receive::parse emits the 40-zero hex; normalize to empty for both ends.
@@ -1033,6 +1046,10 @@ async fn receive_pack_process(
         fsck: st.cfg.wal.fsck_objects,
         max_bytes,
         thin: true,
+        limits: Some(walgit_git::pack_guard::PackLimits {
+            max_object_bytes: st.cfg.server.max_object_bytes.as_u64(),
+            max_inflated_bytes: st.cfg.server.max_push_inflated_bytes.as_u64(),
+        }),
     };
     let local = handle.local().clone();
     let ingest = local

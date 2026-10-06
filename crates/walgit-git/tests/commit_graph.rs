@@ -26,6 +26,7 @@ async fn ingest(repo: &LocalRepo, pack: Vec<u8>) -> gix_hash::ObjectId {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await

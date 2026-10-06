@@ -400,6 +400,7 @@ async fn run_shapes(commits: usize, files: usize, per_commit: usize, dirs: usize
                         fsck: false,
                         max_bytes: None,
                         thin: false,
+                        limits: None,
                     },
                 )
                 .await

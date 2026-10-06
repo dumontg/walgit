@@ -55,6 +55,17 @@ pub struct ServerConfig {
     pub drain_timeout: Duration,
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
+    /// Largest object a push may carry: an entry whose header declares more, or a delta
+    /// that builds more, is refused before `git index-pack` reads the pack. Bounds what
+    /// one object costs in memory while it is indexed.
+    pub max_object_bytes: ByteSize,
+    /// What one pushed pack may inflate to in all: a pack of tiny deltas can each build
+    /// an object of up to `max_object_bytes`.
+    pub max_push_inflated_bytes: ByteSize,
+    /// Largest git request outside pack data, once gzip is decoded: an upload-pack
+    /// request (wants, haves, filters), or the ref updates in front of a pushed pack. A
+    /// few kilobytes of gzip can decode to gigabytes.
+    pub max_command_bytes: ByteSize,
     /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
     /// single maintenance instance `["maintain"]` (checkpoint / compact
     /// loops over every repo; `compact` is its sub-role). Empty = all.
@@ -832,6 +843,9 @@ impl Default for ServerConfig {
             request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
+            max_object_bytes: ByteSize::mib(100),
+            max_push_inflated_bytes: ByteSize::gib(8),
+            max_command_bytes: ByteSize::mib(64),
             roles: vec![],
             auth: AuthConfig::default(),
             public_url: None,

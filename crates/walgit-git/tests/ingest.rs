@@ -32,6 +32,7 @@ async fn ingest_pack_objects_present_fsck_ok() {
                 fsck: true,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -75,6 +76,7 @@ async fn ingest_pack_objects_present_fsck_ok() {
                 fsck: false,
                 max_bytes: Some(8),
                 thin: false,
+                limits: None,
             },
         )
         .await;
@@ -91,6 +93,7 @@ async fn ingest_pack_objects_present_fsck_ok() {
                 fsck: false,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -117,6 +120,7 @@ async fn ingest_thin_pack_resolves_against_odb() {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -133,6 +137,7 @@ async fn ingest_thin_pack_resolves_against_odb() {
                 fsck: true,
                 max_bytes: None,
                 thin: true,
+                limits: None,
             },
         )
         .await
@@ -171,6 +176,7 @@ async fn install_and_remove_pack() {
                 fsck: false,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -213,6 +219,7 @@ async fn ingest_distinct_packs_concurrently() {
                     fsck: false,
                     max_bytes: None,
                     thin: false,
+                    limits: None,
                 },
             )
             .await
@@ -311,6 +318,7 @@ async fn ingest_large_delta_pack() {
                 fsck: true,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -379,6 +387,7 @@ async fn ingest_large_delta_pack() {
                 fsck: false,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -390,6 +399,7 @@ async fn ingest_large_delta_pack() {
                 fsck: true,
                 max_bytes: None,
                 thin: true,
+                limits: None,
             },
         )
         .await
@@ -427,6 +437,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
         fsck: true,
         max_bytes,
         thin,
+        limits: None,
     };
     let pack_count = || repo.packs().map_or(0, |p| p.len());
 
@@ -497,6 +508,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
             fsck: false,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
