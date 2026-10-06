@@ -44,6 +44,9 @@ mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (gene
 
 [server.auth]
 mode = "none"                     # "none" | "token" | "oidc"
+unauthenticated_public_bind = false # none mode on a non-loopback listen: only behind a front that authenticates every
+                                  # request and names the user in X-Walgit-Principal (recorded as the push author); the
+                                  # front must overwrite any X-Walgit-Principal a client sends
                                   #   none  — everyone is `anon` with write+admin; loopback listen only
                                   #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
                                   #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
