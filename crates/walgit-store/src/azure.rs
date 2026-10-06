@@ -27,6 +27,9 @@
 //!
 //! `List Blobs` pages by an opaque marker and has no `start-after`: keys up to
 //! `start_after` are skipped client side (listings are off the hot path, principle VII).
+//! An account with a hierarchical namespace (Data Lake Storage Gen2) creates a directory
+//! for every `/` in a key and lists each one as a zero-length blob with
+//! `ResourceType` `directory`; those are skipped, so only objects are listed.
 //!
 //! ## Timeouts
 //!
@@ -898,6 +901,9 @@ struct ListPage {
 fn parse_list(xml: &str) -> Result<ListPage> {
     let mut page = ListPage::default();
     for blob in elements(xml, "Blob") {
+        if element(blob, "ResourceType") == Some("directory") {
+            continue;
+        }
         let name = element(blob, "Name")
             .ok_or_else(|| StoreError::other(anyhow::anyhow!("azure list: blob without name")))?;
         let size = element(blob, "Content-Length")
@@ -1026,6 +1032,20 @@ mod tests {
         let last =
             parse_list("<EnumerationResults><Blobs/><NextMarker /></EnumerationResults>").unwrap();
         assert!(last.next_marker.is_none());
+    }
+
+    /// The shape a hierarchical namespace account answers for `prefix=r/wal`: the
+    /// `r/wal` directory itself, then the files under it.
+    #[test]
+    fn list_pages_skip_hierarchical_namespace_directories() {
+        let xml = "<EnumerationResults><Prefix>r/wal</Prefix><Blobs>\
+            <Blob><Name>r/wal</Name><Properties><Etag>0x8D2</Etag><ResourceType>directory</ResourceType><Content-Length>0</Content-Length><BlobType>BlockBlob</BlobType></Properties><Metadata><hdi_isfolder>true</hdi_isfolder></Metadata><OrMetadata /></Blob>\
+            <Blob><Name>r/wal/1.pack</Name><Properties><Etag>0x8D3</Etag><ResourceType>file</ResourceType><Content-Length>307</Content-Length><BlobType>BlockBlob</BlobType></Properties><Metadata /><OrMetadata /></Blob>\
+            </Blobs><NextMarker /></EnumerationResults>";
+        let page = parse_list(xml).unwrap();
+        let keys: Vec<&str> = page.blobs.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(keys, vec!["r/wal/1.pack"]);
+        assert_eq!(page.blobs[0].size, 307);
     }
 
     /// A token endpoint that checks the federated token exchange and hands out
