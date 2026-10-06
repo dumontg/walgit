@@ -17,6 +17,9 @@ max_push_bytes = "64GiB"          # largest accepted push
 max_object_bytes = "100MiB"       # largest object a push may carry (a delta: the object it builds); refused before index-pack
 max_push_inflated_bytes = "8GiB"  # what one pushed pack may inflate to in all (bounds pack and delta bombs)
 max_command_bytes = "64MiB"       # an upload-pack request, or the ref updates before a pushed pack, gzip decoded
+body_idle_timeout = "30s"         # a request body that sends nothing this long ends its request
+min_body_bytes_per_second = "64KiB" # slowest a request body may arrive, over each body_rate_window
+body_rate_window = "30s"
 # Roles this instance performs: "serve" (git, API, UI, LFS), "maintain" (checkpoints,
 # compaction, fsck/repair — implies compact), "events" (the webhook bridge).
 # Empty = all of them: the one-box shape.

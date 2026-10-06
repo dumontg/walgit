@@ -66,6 +66,14 @@ pub struct ServerConfig {
     /// request (wants, haves, filters), or the ref updates in front of a pushed pack. A
     /// few kilobytes of gzip can decode to gigabytes.
     pub max_command_bytes: ByteSize,
+    /// A request body that sends nothing for this long ends the request.
+    #[serde(with = "humantime_serde")]
+    pub body_idle_timeout: Duration,
+    /// Slowest a request body may arrive, averaged over each `body_rate_window`: slower
+    /// bodies (a client holding a request slot open) end the request.
+    pub min_body_bytes_per_second: ByteSize,
+    #[serde(with = "humantime_serde")]
+    pub body_rate_window: Duration,
     /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
     /// single maintenance instance `["maintain"]` (checkpoint / compact
     /// loops over every repo; `compact` is its sub-role). Empty = all.
@@ -846,6 +854,9 @@ impl Default for ServerConfig {
             max_object_bytes: ByteSize::mib(100),
             max_push_inflated_bytes: ByteSize::gib(8),
             max_command_bytes: ByteSize::mib(64),
+            body_idle_timeout: Duration::from_secs(30),
+            min_body_bytes_per_second: ByteSize::kib(64),
+            body_rate_window: Duration::from_secs(30),
             roles: vec![],
             auth: AuthConfig::default(),
             public_url: None,

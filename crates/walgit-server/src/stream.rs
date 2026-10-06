@@ -10,10 +10,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
-use futures::stream::StreamExt;
+use bytes::Bytes;
+use futures::stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{Instant, Sleep};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 /// Convert an axum request body into an `AsyncRead`. Map errors to `io::Error`.
@@ -149,9 +152,178 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
     }
 }
 
+/// A request body held to a minimum pace: it ends with an error when nothing arrives for
+/// `idle`, or when less than `min_rate` bytes per second arrived over a `window`. A client
+/// trickling a body (or never finishing it) would otherwise hold its request slot, and
+/// the handler waiting on it, for as long as the connection stays open.
+pub struct PacedBody<S> {
+    inner: S,
+    idle: Duration,
+    min_rate: u64,
+    window: Duration,
+    deadline: Pin<Box<Sleep>>,
+    window_start: Option<Instant>,
+    window_bytes: u64,
+}
+
+impl<S> PacedBody<S> {
+    pub fn new(inner: S, idle: Duration, min_rate: u64, window: Duration) -> Self {
+        PacedBody {
+            inner,
+            idle,
+            min_rate,
+            window,
+            deadline: Box::pin(tokio::time::sleep(idle)),
+            window_start: None,
+            window_bytes: 0,
+        }
+    }
+}
+
+impl<S, E> Stream for PacedBody<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Into<axum::BoxError>,
+{
+    type Item = Result<Bytes, axum::BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let now = Instant::now();
+        // The clock starts when the handler first reads the body: work before that (a
+        // repository sync while the client waits on `100-continue`) is not the client's.
+        if this.window_start.is_none() {
+            this.deadline.as_mut().reset(now + this.idle);
+        }
+        let start = *this.window_start.get_or_insert(now);
+        match this.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.deadline.as_mut().reset(now + this.idle);
+                this.window_bytes += chunk.len() as u64;
+                let elapsed = now.saturating_duration_since(start);
+                if elapsed >= this.window {
+                    let wanted = u128::from(this.min_rate) * elapsed.as_millis() / 1000;
+                    if u128::from(this.window_bytes) < wanted {
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "request body sent too slowly",
+                        )
+                        .into())));
+                    }
+                    this.window_start = Some(now);
+                    this.window_bytes = 0;
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if this.deadline.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body stalled",
+                    )
+                    .into())));
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// Middleware: every request body is read through [`PacedBody`].
+pub async fn pace_request_body(
+    axum::extract::State(st): axum::extract::State<Arc<crate::AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let server = &st.cfg.server;
+    let (parts, body) = req.into_parts();
+    let paced = PacedBody::new(
+        body.into_data_stream(),
+        server.body_idle_timeout,
+        server.min_body_bytes_per_second.as_u64(),
+        server.body_rate_window,
+    );
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        Body::from_stream(paced),
+    ))
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunks(
+        size: usize,
+        every: Duration,
+        count: usize,
+    ) -> impl Stream<Item = Result<Bytes, io::Error>> + Unpin {
+        Box::pin(futures::stream::iter(0..count).then(move |_| async move {
+            tokio::time::sleep(every).await;
+            Ok(Bytes::from(vec![0u8; size]))
+        }))
+    }
+
+    async fn drain<S: Stream<Item = Result<Bytes, axum::BoxError>> + Unpin>(
+        mut body: S,
+    ) -> (u64, Option<String>) {
+        let mut got = 0;
+        while let Some(item) = body.next().await {
+            match item {
+                Ok(chunk) => got += chunk.len() as u64,
+                Err(e) => return (got, Some(e.to_string())),
+            }
+        }
+        (got, None)
+    }
+
+    #[tokio::test]
+    async fn a_body_at_pace_arrives_whole() {
+        let body = PacedBody::new(
+            chunks(1000, Duration::from_millis(10), 30),
+            Duration::from_millis(200),
+            10_000,
+            Duration::from_millis(100),
+        );
+        assert_eq!(drain(body).await, (30_000, None));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_sending_is_cut() {
+        let inner = chunks(10, Duration::ZERO, 1).chain(futures::stream::pending());
+        let body = PacedBody::new(inner, Duration::from_millis(100), 1, Duration::from_mins(1));
+        let (got, err) = drain(body).await;
+        assert_eq!(got, 10);
+        assert_eq!(err.as_deref(), Some("request body stalled"));
+    }
+
+    #[tokio::test]
+    async fn a_trickled_body_is_cut() {
+        let body = PacedBody::new(
+            chunks(10, Duration::from_millis(20), 100),
+            Duration::from_secs(5),
+            10_000,
+            Duration::from_millis(200),
+        );
+        let (got, err) = drain(body).await;
+        assert!(got < 1000, "{got}");
+        assert_eq!(err.as_deref(), Some("request body sent too slowly"));
+    }
+
+    #[tokio::test]
+    async fn the_clock_starts_at_the_first_read() {
+        let body = PacedBody::new(
+            chunks(10, Duration::ZERO, 1),
+            Duration::from_millis(50),
+            1,
+            Duration::from_mins(1),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(drain(body).await, (10, None));
+    }
 
     #[tokio::test]
     async fn a_limited_reader_fails_past_its_limit_until_raised() {

@@ -504,6 +504,10 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   object is inflated twice (guard, then index-pack), in parallel with receiving. Git requests outside pack data
   (upload-pack requests, push commands) are held to `max_command_bytes` once gzip is decoded.
 
+- **D52 (2026-10-06): Request bodies keep a minimum pace.** `stream::PacedBody` wraps every route: a body idle
+  past `body_idle_timeout`, or under `min_body_bytes_per_second` over `body_rate_window`, ends the request, so
+  trickled bodies cannot hold request slots. The clock starts at the handler's first read.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
