@@ -437,6 +437,7 @@ mod tests {
                         fsck: false,
                         max_bytes: None,
                         thin: false,
+                        limits: None,
                     },
                 )
                 .await

@@ -194,6 +194,7 @@ async fn ingest_pack_data(
                 fsck: false,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await

@@ -43,6 +43,7 @@ async fn ref_txn_atomicity_and_conflicts() {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -154,6 +155,7 @@ async fn load_ref_snapshot_50k_refs_fast_and_readable() {
             fsck: false,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await

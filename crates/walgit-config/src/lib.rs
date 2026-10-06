@@ -55,6 +55,25 @@ pub struct ServerConfig {
     pub drain_timeout: Duration,
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
+    /// Largest object a push may carry: an entry whose header declares more, or a delta
+    /// that builds more, is refused before `git index-pack` reads the pack. Bounds what
+    /// one object costs in memory while it is indexed.
+    pub max_object_bytes: ByteSize,
+    /// What one pushed pack may inflate to in all: a pack of tiny deltas can each build
+    /// an object of up to `max_object_bytes`.
+    pub max_push_inflated_bytes: ByteSize,
+    /// Largest git request outside pack data, once gzip is decoded: an upload-pack
+    /// request (wants, haves, filters), or the ref updates in front of a pushed pack. A
+    /// few kilobytes of gzip can decode to gigabytes.
+    pub max_command_bytes: ByteSize,
+    /// A request body that sends nothing for this long ends the request.
+    #[serde(with = "humantime_serde")]
+    pub body_idle_timeout: Duration,
+    /// Slowest a request body may arrive, averaged over each `body_rate_window`: slower
+    /// bodies (a client holding a request slot open) end the request.
+    pub min_body_bytes_per_second: ByteSize,
+    #[serde(with = "humantime_serde")]
+    pub body_rate_window: Duration,
     /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
     /// single maintenance instance `["maintain"]` (checkpoint / compact
     /// loops over every repo; `compact` is its sub-role). Empty = all.
@@ -143,6 +162,11 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
+    /// `none` mode on a non-loopback `server.listen`: only behind a front that
+    /// authenticates every request and names the user in `X-Walgit-Principal`, which
+    /// walgit then records as the author of each push (the first push creates the
+    /// repository).
+    pub unauthenticated_public_bind: bool,
     /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
@@ -235,6 +259,7 @@ pub struct StoreConfig {
     pub prefix: String,
     pub gcs: GcsConfig,
     pub s3: S3Config,
+    pub azure: AzureConfig,
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -247,6 +272,8 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
+    /// Azure Blob Storage; `bucket` is the container.
+    Azure,
     /// Tests only.
     Memory,
 }
@@ -285,6 +312,33 @@ pub struct S3Config {
     pub access_key_env: String,
     pub secret_key_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureConfig {
+    pub auth: AzureAuth,
+    /// `shared_key`: env var holding the storage account connection string (`AccountName`,
+    /// `AccountKey`, and `BlobEndpoint` for Azurite or a custom endpoint). Read at startup.
+    pub connection_string_env: String,
+    /// `workload_identity`: the storage account name.
+    pub account: String,
+    /// `workload_identity`: the blob endpoint; empty means
+    /// `https://<account>.blob.core.windows.net`.
+    pub endpoint: String,
+}
+
+/// How walgit authenticates to the storage account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureAuth {
+    /// The account key from a connection string signs every request.
+    #[default]
+    SharedKey,
+    /// Microsoft Entra tokens for the pod's federated identity (AKS Workload Identity):
+    /// `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and
+    /// `AZURE_AUTHORITY_HOST`, as the AKS webhook injects them.
+    WorkloadIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -802,6 +856,12 @@ impl Default for ServerConfig {
             request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
+            max_object_bytes: ByteSize::mib(100),
+            max_push_inflated_bytes: ByteSize::gib(8),
+            max_command_bytes: ByteSize::mib(64),
+            body_idle_timeout: Duration::from_secs(30),
+            min_body_bytes_per_second: ByteSize::kib(64),
+            body_rate_window: Duration::from_secs(30),
             roles: vec![],
             auth: AuthConfig::default(),
             public_url: None,
@@ -816,6 +876,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             mode: AuthMode::None,
+            unauthenticated_public_bind: false,
             anonymous_read: true,
             tokens: vec![],
             issuer: String::new(),
@@ -842,6 +903,7 @@ impl Default for StoreConfig {
             prefix: String::new(),
             gcs: GcsConfig::default(),
             s3: S3Config::default(),
+            azure: AzureConfig::default(),
             max_retries: 8,
             multipart_threshold: ByteSize::mib(64),
             multipart_part_size: ByteSize::mib(32),
@@ -867,6 +929,16 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
+        }
+    }
+}
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            auth: AzureAuth::SharedKey,
+            connection_string_env: "AZURE_STORAGE_CONNECTION_STRING".into(),
+            account: String::new(),
+            endpoint: String::new(),
         }
     }
 }
@@ -1088,6 +1160,12 @@ impl Config {
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        anyhow::ensure!(
+            self.store.backend != StoreBackend::Azure
+                || self.store.azure.auth != AzureAuth::WorkloadIdentity
+                || !self.store.azure.account.is_empty(),
+            "store.azure.account must be set with auth = workload_identity"
+        );
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1175,8 +1253,8 @@ impl Config {
         let a = &self.server.auth;
         if a.mode == AuthMode::None {
             anyhow::ensure!(
-                self.server.listen.ip().is_loopback(),
-                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
+                self.server.listen.ip().is_loopback() || a.unauthenticated_public_bind,
+                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind, or set server.auth.unauthenticated_public_bind behind an authenticating front",
                 self.server.listen
             );
         }
@@ -1438,6 +1516,16 @@ mod tests {
         assert_eq!(c.placement.serve_exclude, vec!["acme/monorepo"]);
     }
 
+    #[test]
+    fn azure_workload_identity_needs_an_account() {
+        let base = "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\nauth = \"workload_identity\"\n";
+        let err = Config::parse(base).unwrap_err();
+        assert!(err.to_string().contains("store.azure.account"), "{err}");
+        let c = Config::parse(&format!("{base}account = \"acct\"\n")).unwrap();
+        assert_eq!(c.store.azure.auth, AzureAuth::WorkloadIdentity);
+        assert_eq!(c.store.azure.account, "acct");
+    }
+
     /// You cannot maintain what you refuse to serve.
     #[test]
     fn validate_refuses_maintaining_a_repo_the_host_does_not_serve() {
@@ -1658,6 +1746,12 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
+        // ... unless the deployment says a front authenticates (D53).
+        let fronted = Config::parse(
+            "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\nunauthenticated_public_bind = true\n",
+        )
+        .unwrap();
+        assert!(fronted.server.auth.unauthenticated_public_bind);
         // The issuer is an oidc-only requirement: none and token mode validate without one.
         let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
         assert_eq!(none.server.auth.issuer, "");

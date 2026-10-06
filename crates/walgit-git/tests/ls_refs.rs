@@ -27,6 +27,7 @@ async fn setup() -> (tempfile::TempDir, LocalRepo, String, String, String) {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await

@@ -75,7 +75,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
+- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback or `unauthenticated_public_bind` is set for a front that authenticates and sends `X-Walgit-Principal`, D53),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -487,6 +487,33 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-10-06): Azure Blob Storage is a store backend.** `azure` (`walgit-store/src/azure.rs`) speaks
+  the Blob REST API, authenticated with the account's shared key or with AKS Workload Identity (the pod's
+  federated token exchanged for a Microsoft Entra token, cached until 5 minutes before expiry). CAS is
+  `If-Match`/`If-None-Match`, conditional delete is native, and large objects go up as blocks committed by one
+  conditional `Put Block List` (a large `Create` is atomic, unlike S3). No compose: `publish` uploads whole.
+  Every request has connect and read timeouts; a full store stall still lasts minutes for a client, because
+  the retries above the store multiply them. Contract suite against Azurite.
+
+- **D51 (2026-10-06): Pushed packs are held to object and inflation limits before `index-pack` reads
+  them.** `git index-pack` inflates whatever entry headers declare and holds objects while it resolves deltas,
+  so an 82 KiB push of deltas could cost a gigabyte. The guard (`walgit-git/src/pack_guard.rs`) inflates each
+  stream into a scratch buffer on a blocking thread, a few chunks behind the spool to disk, and refuses an
+  entry declaring more than `max_object_bytes`, a delta building more, a stream inflating past its header, or a
+  pack adding up to more than `max_push_inflated_bytes`; the push answers `unpack <reason>`. Cost: every pushed
+  object is inflated twice (guard, then index-pack), in parallel with receiving. Git requests outside pack data
+  (upload-pack requests, push commands) are held to `max_command_bytes` once gzip is decoded.
+
+- **D52 (2026-10-06): Request bodies keep a minimum pace.** `stream::PacedBody` wraps every route: a body idle
+  past `body_idle_timeout`, or under `min_body_bytes_per_second` over `body_rate_window`, ends the request, so
+  trickled bodies cannot hold request slots. The clock starts at the handler's first read.
+
+- **D53 (2026-10-06): `none` mode may bind a non-loopback address behind an authenticating front.**
+  `server.auth.unauthenticated_public_bind` is for a deployment whose front authenticates every request and
+  names the user in `X-Walgit-Principal` (already honoured in `none` mode); that name is the push author in
+  the log and the principal policy rules see. The front must overwrite the header on every request: walgit
+  trusts whatever arrives. No other auth path changes.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
@@ -506,8 +533,9 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
-- **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
+- **S3, GCS and Azure are first class.** Every store feature has an implementation in each and runs in the contract
+  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`, `just test-azure` against Azurite); "GCS only" is
+  a bug. Compose is the exception: optional by design, absent on Azure (D50).
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Exercise
   ordinary clone/fetch and bounded maintenance against the rig before testing on large repositories.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full

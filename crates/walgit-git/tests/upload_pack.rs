@@ -30,6 +30,7 @@ async fn setup() -> (tempfile::TempDir, LocalRepo, String, String) {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await
@@ -254,6 +255,7 @@ async fn fetch_filter_blob_limit_excludes_large_blobs() {
                 fsck: true,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -360,6 +362,7 @@ async fn fetch_include_tag_sends_annotated_tag() {
                 fsck: true,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -442,6 +445,7 @@ async fn fetch_deepen_shallow_info() {
                 fsck: true,
                 max_bytes: None,
                 thin: false,
+                limits: None,
             },
         )
         .await
@@ -621,6 +625,7 @@ async fn fetch_skips_gitlink_entries() {
             fsck: true,
             max_bytes: None,
             thin: false,
+            limits: None,
         },
     )
     .await

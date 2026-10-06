@@ -206,6 +206,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             ),
         )
         .fallback(dispatch)
+        // Request bodies sent too slowly end their request (`server.body_*`).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            stream::pace_request_body,
+        ))
         // Sliding browser sessions: re-issue a session cookie older than ttl/4.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
