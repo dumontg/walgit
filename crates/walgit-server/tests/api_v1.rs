@@ -959,7 +959,7 @@ async fn a_proxy_that_does_not_prove_itself_is_a_403_naming_the_proxy_never_a_40
         "the right secret (stored with a trailing newline) is accepted"
     );
 
-    for secret in [None, Some("wrong"), Some(&PROXY_SECRET[1..])] {
+    for secret in [None, Some("wrong"), PROXY_SECRET.get(1..)] {
         for (method, path) in [
             (reqwest::Method::GET, "/api/v1/owners"),
             (reqwest::Method::GET, "/api/v1/me"),
