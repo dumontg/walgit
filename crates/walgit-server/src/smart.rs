@@ -18,6 +18,12 @@ use crate::repo::RepoRoute;
 use crate::stream::{VecWriter, body_to_async_read, maybe_gunzip, write_body_pipe};
 use tracing::Instrument;
 
+/// git's own client sends up to 10,000 object ids per request (`cat-file`
+/// remote-object-info); the protocol cannot advertise a smaller limit.
+const MAX_OBJECT_INFO_OIDS: usize = 10_000;
+/// Remote pack header reads one object-info request may have in flight.
+const OBJECT_INFO_PARALLEL_READS: usize = 16;
+
 /// Cache-control headers for smart endpoints (info/refs and pkt responses).
 fn no_cache_headers() -> [(axum::http::HeaderName, &'static str); 3] {
     [
@@ -58,6 +64,17 @@ pub async fn info_refs(
             e,
             crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
         );
+        // A proxy that did not prove itself: nothing the client holds can fix it, and behind
+        // a proxy `Authorization` has usually been consumed already — say so in band.
+        if is_git_client(headers)
+            && !service_param.is_empty()
+            && matches!(e, crate::auth::AuthError::UntrustedProxy)
+        {
+            return Ok(git_err_response(
+                &service_param,
+                &format!("walgit: {}", crate::error::UNTRUSTED_PROXY_MESSAGE),
+            ));
+        }
         if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
             return Ok(git_err_response(
                 &service_param,
@@ -151,6 +168,7 @@ async fn v2_capability_advert(
     // packfile section: auth, WAL sync, materialization progress. Both engines frame their sections that way.
     fetch.push_str(" sideband-all packfile-uris packfile-indexes");
     pktline::encode_text(buf, &format!("{fetch}\n"));
+    pktline::encode_text(buf, "object-info=size\n");
     pktline::encode_text(buf, "server-option\n");
     let fmt = match handle.local().object_format() {
         walgit_git::ObjectFormat::Sha1 => "sha1",
@@ -338,16 +356,100 @@ async fn upload_pack_v2(
             ))
         }
         "object-info" => {
-            let _guard = handle.sync().await.map_err(wal_err)?;
+            if let Some(r) = not_served_here(st, &route.id, "git-upload-pack").await {
+                return Ok(r);
+            }
             let req = walgit_git::pkt::parse_object_info(&cmd);
+            let req = walgit_git::pkt::read_object_info_args(reader, req)
+                .await
+                .map_err(git_err)?;
+            if !req.size {
+                return Err(ApiError::BadRequest(
+                    "object-info currently requires the size attribute".into(),
+                ));
+            }
+            if req.oids.len() > MAX_OBJECT_INFO_OIDS {
+                return Ok(git_err_response(
+                    "git-upload-pack",
+                    &format!(
+                        "walgit: object-info request has {} object ids; maximum is {MAX_OBJECT_INFO_OIDS}",
+                        req.oids.len()
+                    ),
+                ));
+            }
+            let (_guard, access) = handle.sync_objects().await.map_err(wal_err)?;
+            let repo_key = route.id.to_string();
+            let version = handle.manifest_version();
+            let oids: Vec<Option<gix_hash::ObjectId>> = req
+                .oids
+                .iter()
+                .map(|hex| gix_hash::ObjectId::from_hex(hex.as_bytes()).ok())
+                .collect();
+            // Only found sizes are cached: a miss cached under a version read
+            // after the sync could hide an object pushed meanwhile.
+            let sizes = match access {
+                walgit_wal::ObjectAccess::Local => {
+                    let local = handle.local().clone();
+                    let cache = st.caches.object_info.clone();
+                    let repo_key = repo_key.clone();
+                    let version = version.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let repo = local.gix();
+                        oids.iter()
+                            .map(|oid| {
+                                let oid = (*oid)?;
+                                if let Some(size) = cache.get(&repo_key, version.as_ref(), oid) {
+                                    return size;
+                                }
+                                let size = gix_object::FindHeader::try_header(&repo.objects, &oid)
+                                    .ok()
+                                    .flatten()
+                                    .map(|header| header.size);
+                                if size.is_some() {
+                                    cache.insert(&repo_key, version.as_ref(), oid, size);
+                                }
+                                size
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("object-info: {e}")))?
+                }
+                walgit_wal::ObjectAccess::Remote(packs) => {
+                    use futures::stream::{StreamExt, TryStreamExt};
+                    futures::stream::iter(oids)
+                        .map(|oid| {
+                            let packs = packs.clone();
+                            let cache = st.caches.object_info.clone();
+                            let repo_key = repo_key.clone();
+                            let version = version.clone();
+                            async move {
+                                let Some(oid) = oid else { return Ok(None) };
+                                if let Some(size) = cache.get(&repo_key, version.as_ref(), oid) {
+                                    return Ok(size);
+                                }
+                                let size = packs.header(&oid).await?.map(|(_, size)| size);
+                                if size.is_some() {
+                                    cache.insert(&repo_key, version.as_ref(), oid, size);
+                                }
+                                Ok::<Option<u64>, walgit_wal::WalError>(size)
+                            }
+                        })
+                        .buffered(OBJECT_INFO_PARALLEL_READS)
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map_err(wal_err)?
+                }
+            };
             let mut sizes_buf = Vec::with_capacity(256);
-            let repo = handle.local().gix();
-            for hex in &req.oids {
-                let size = gix_hash::ObjectId::from_hex(hex.as_bytes())
-                    .ok()
-                    .and_then(|oid| repo.find_object(oid).ok())
-                    .map_or(-1, |o| o.data.len() as i64);
-                pktline::encode_text(&mut sizes_buf, &format!("size {size}\n"));
+            pktline::encode_text(&mut sizes_buf, "size\n");
+            for (hex, size) in req.oids.iter().zip(sizes) {
+                match size {
+                    Some(size) => {
+                        pktline::encode_text(&mut sizes_buf, &format!("{hex} {size}\n"));
+                    }
+                    None => pktline::encode_text(&mut sizes_buf, &format!("{hex} \n")),
+                }
             }
             pktline::encode_flush(&mut sizes_buf);
             Ok(text_response(
@@ -1478,6 +1580,9 @@ pub(crate) fn auth_help_message(
         .to_string();
     let why = match e {
         crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
+        crate::auth::AuthError::UntrustedProxy => {
+            "the proxy in front of this host did not prove itself to walgit (misconfigured proxy)"
+        }
         crate::auth::AuthError::Unavailable => {
             "the token verifier is temporarily unavailable; retry"
         }
@@ -1582,6 +1687,7 @@ pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

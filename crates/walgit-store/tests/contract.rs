@@ -676,6 +676,136 @@ async fn memory_contract() {
     run_contract(store, "").await;
 }
 
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn azure_contract() {
+    let Ok(endpoint) = std::env::var("WALGIT_TEST_AZURE_ENDPOINT") else {
+        eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_ENDPOINT not set");
+        return;
+    };
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::Azure,
+        bucket: std::env::var("WALGIT_TEST_AZURE_CONTAINER").expect("Azure test container"),
+        azure: walgit_config::AzureConfig {
+            endpoint,
+            ..Default::default()
+        },
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(5),
+        ..Default::default()
+    };
+    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+    let store: DynStore =
+        Arc::new(walgit_store::azure::AzureStore::new(&cfg).expect("AzureStore::new"));
+    run_contract(store.clone(), &prefix).await;
+    // File bodies and staged CAS must obey the same contract as small byte PUTs.
+    let file = tempfile::NamedTempFile::new().expect("file fixture");
+    let data = vec![0x5a; 6 * 1024 * 1024 + 17];
+    tokio::fs::write(file.path(), &data)
+        .await
+        .expect("write fixture");
+    let key = format!("{prefix}/file-body");
+    let first = store
+        .put(
+            &key,
+            PutBody::File(file.path().into()),
+            PutMode::Create.into(),
+        )
+        .await
+        .expect("file upload");
+    let next = store
+        .put(
+            &key,
+            PutBody::File(file.path().into()),
+            PutMode::Update(first.version.clone()).into(),
+        )
+        .await
+        .expect("staged CAS");
+    assert_ne!(first.version, next.version);
+    assert!(
+        store
+            .put(
+                &key,
+                PutBody::File(file.path().into()),
+                PutMode::Update(first.version).into()
+            )
+            .await
+            .unwrap_err()
+            .is_precondition_failed()
+    );
+    let (meta, got) = store
+        .get(
+            &key,
+            GetOptions {
+                range: Some(2..5),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range")
+        .bytes()
+        .await
+        .expect("range bytes")
+        .expect("object");
+    assert_eq!(meta.size, data.len() as u64);
+    assert_eq!(&got[..], &data[2..5]);
+    let (_, got) = store
+        .get(&key, GetOptions::default())
+        .await
+        .expect("file get")
+        .bytes()
+        .await
+        .expect("file bytes")
+        .expect("object");
+    assert_eq!(&got[..], &data);
+    for leaf in ["a&b/one", "a&b/two", "z/one"] {
+        store
+            .put(
+                &format!("{prefix}/hierarchy/{leaf}"),
+                Bytes::from_static(b"x").into(),
+                PutMode::Create.into(),
+            )
+            .await
+            .expect("hierarchy fixture");
+    }
+    assert_eq!(
+        store
+            .list_prefixes(&format!("{prefix}/hierarchy/"))
+            .await
+            .expect("delimited list"),
+        [
+            format!("{prefix}/hierarchy/a&b/"),
+            format!("{prefix}/hierarchy/z/")
+        ]
+    );
+    let empty = store
+        .compose(
+            &format!("{prefix}/empty-compose"),
+            &[],
+            PutMode::Create.into(),
+        )
+        .await
+        .expect("empty compose");
+    assert_eq!(empty.size, 0);
+    // Under SAS-token auth (the emulator path) no user delegation key exists to
+    // sign with, so LFS URLs fall back to the proxy.
+    assert!(
+        store
+            .signed_get_url(&key, std::time::Duration::from_mins(1))
+            .await
+            .expect("signing under sas auth")
+            .is_none()
+    );
+
+    let remaining: Vec<_> = store.list(&prefix, None).collect().await;
+    for entry in remaining {
+        store
+            .delete(&entry.expect("list cleanup").key, None)
+            .await
+            .expect("cleanup");
+    }
+}
+
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
@@ -708,7 +838,9 @@ async fn s3_contract() {
         ..Default::default()
     };
 
-    let store = walgit_store::s3::S3Store::new(&cfg).expect("S3Store::new");
+    let store = walgit_store::s3::S3Store::new(&cfg)
+        .await
+        .expect("S3Store::new");
     let store: DynStore = Arc::new(store);
 
     run_contract(store.clone(), &prefix).await;
@@ -722,42 +854,6 @@ async fn s3_contract() {
     .filter_map(|r| async move { r.ok() })
     .collect::<Vec<_>>()
     .await;
-    for m in to_delete {
-        let _ = store.delete(&m.key, None).await;
-    }
-}
-
-#[cfg(feature = "azure")]
-#[tokio::test]
-async fn azure_contract() {
-    if std::env::var("WALGIT_TEST_AZURE_CONNECTION_STRING").is_err() {
-        eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_CONNECTION_STRING not set");
-        return;
-    }
-    let container =
-        std::env::var("WALGIT_TEST_AZURE_CONTAINER").unwrap_or_else(|_| "walgit-test".into());
-    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
-    let cfg = walgit_config::StoreConfig {
-        backend: walgit_config::StoreBackend::Azure,
-        bucket: container,
-        prefix: prefix.clone(),
-        azure: walgit_config::AzureConfig {
-            connection_string_env: "WALGIT_TEST_AZURE_CONNECTION_STRING".into(),
-            ..Default::default()
-        },
-        multipart_threshold: bytesize::ByteSize::mib(5),
-        multipart_part_size: bytesize::ByteSize::mib(5),
-        ..Default::default()
-    };
-    let store: DynStore =
-        Arc::new(walgit_store::azure::AzureStore::new(&cfg).expect("AzureStore::new"));
-
-    run_contract(store.clone(), &prefix).await;
-
-    let to_delete: Vec<_> = walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-        .filter_map(|r| async move { r.ok() })
-        .collect()
-        .await;
     for m in to_delete {
         let _ = store.delete(&m.key, None).await;
     }

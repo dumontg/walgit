@@ -162,11 +162,6 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
-    /// `none` mode on a non-loopback `server.listen`: only behind a front that
-    /// authenticates every request and names the user in `X-Walgit-Principal`, which
-    /// walgit then records as the author of each push (the first push creates the
-    /// repository).
-    pub unauthenticated_public_bind: bool,
     /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
@@ -214,6 +209,13 @@ pub struct AuthConfig {
     /// Pair with `oauth_client_secret`; both or neither.
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<String>,
+    /// `proxy` mode: name of the environment variable holding the secret the identity-aware
+    /// proxy presents in `X-Walgit-Proxy-Secret` on every request (compared in constant time,
+    /// at least 32 bytes after trimming surrounding whitespace, so a trailing newline from a
+    /// secret file is harmless). Required in proxy mode, loopback listen included: in a
+    /// sidecar deployment every container in the pod shares the loopback interface, so
+    /// reaching the port does not identify the proxy. Never read in other modes.
+    pub proxy_secret_env: Option<String>,
 }
 
 /// Prefix of access tokens walgit mints itself (`/_auth/tokens`): recognisable in logs and
@@ -232,6 +234,12 @@ pub enum AuthMode {
     /// `OpenID` Connect: browser sign-in through the issuer, ID tokens as bearers, plus
     /// walgit-issued access tokens for git — and `tokens` for robots.
     Oidc,
+    /// An identity-aware proxy in front authenticates and authorizes every request and
+    /// asserts the result in headers: `X-Walgit-Principal` (who), `X-Walgit-Access`
+    /// (`read` | `write` | `admin`), optionally `X-Walgit-Owners` (which owners exist for
+    /// this caller). The proxy proves itself with `X-Walgit-Proxy-Secret`
+    /// (`proxy_secret_env`) on every request, loopback listen included. No anonymous access.
+    Proxy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +268,7 @@ pub struct StoreConfig {
     pub gcs: GcsConfig,
     pub s3: S3Config,
     pub azure: AzureConfig,
+    /// Extra attempts for transient backend failures and interrupted reads; zero disables retries.
     pub max_retries: u32,
     /// Objects larger than this use resumable/multipart upload.
     pub multipart_threshold: ByteSize,
@@ -272,7 +281,6 @@ pub enum StoreBackend {
     #[default]
     Gcs,
     S3,
-    /// Azure Blob Storage; `bucket` is the container.
     Azure,
     /// Tests only.
     Memory,
@@ -314,31 +322,36 @@ pub struct S3Config {
     pub force_path_style: bool,
 }
 
+/// `store.bucket` names the container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AzureConfig {
-    pub auth: AzureAuth,
-    /// `shared_key`: env var holding the storage account connection string (`AccountName`,
-    /// `AccountKey`, and `BlobEndpoint` for Azurite or a custom endpoint). Read at startup.
-    pub connection_string_env: String,
-    /// `workload_identity`: the storage account name.
     pub account: String,
-    /// `workload_identity`: the blob endpoint; empty means
-    /// `https://<account>.blob.core.windows.net`.
+    /// Overrides the derived `https://{account}.blob.core.windows.net`.
     pub endpoint: String,
+    /// Env var holding a SAS token, for emulators and environments without
+    /// Entra ID. Leave the variable unset to use the selected identity credential.
+    pub sas_token_env: String,
+    pub credential: AzureCredential,
+    /// Blocks staged in parallel for one multipart upload.
+    pub max_concurrent_blocks: usize,
 }
 
-/// How walgit authenticates to the storage account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Explicit identity selection avoids falling through to a different principal
+/// when a configured workload identity cannot authenticate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum AzureAuth {
-    /// The account key from a connection string signs every request.
+pub enum AzureCredential {
+    /// Workload identity when `AZURE_FEDERATED_TOKEN_FILE` is set, managed identity otherwise.
     #[default]
-    SharedKey,
-    /// Microsoft Entra tokens for the pod's federated identity (AKS Workload Identity):
-    /// `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and
-    /// `AZURE_AUTHORITY_HOST`, as the AKS webhook injects them.
+    Auto,
     WorkloadIdentity,
+    ManagedIdentity,
+    /// Opt-in local development using `az login`.
+    AzureCli,
+    /// A service principal from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+    /// `AZURE_CLIENT_SECRET`, for hosts with no managed or workload identity.
+    ClientSecret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,6 +830,74 @@ impl Config {
     }
 }
 
+/// Why an override at `path` does not deserialize: the error's first line, or for an unknown
+/// key the section it is not in and the nearest key serde offered (`expected one of `a`, …`),
+/// spelled as the variable to set instead.
+fn env_override_error(path: &[String], err: &str) -> String {
+    let first = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("invalid")
+        .to_string();
+    // `unknown field `x`, expected one of `a`, `b`` → x, then the candidates.
+    let Some((_, tail)) = err.split_once("unknown field `") else {
+        return first;
+    };
+    let mut ticks = tail
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split('`')
+        .step_by(2);
+    let Some(field) = ticks.next() else {
+        return first;
+    };
+    let Some(depth) = path.iter().position(|p| p == field) else {
+        return first;
+    };
+    let section = match path.get(..depth) {
+        Some([]) | None => "the top level".to_string(),
+        Some(s) => format!("[{}]", s.join(".")),
+    };
+    let nearest = ticks
+        .filter(|c| !c.is_empty())
+        .map(|c| (edit_distance(field, c), c))
+        .min()
+        .filter(|(d, _)| *d <= 2.max(field.len() / 3));
+    match nearest {
+        Some((_, key)) => {
+            let fixed: Vec<&str> = path
+                .iter()
+                .take(depth)
+                .map(String::as_str)
+                .chain([key])
+                .collect();
+            format!(
+                "unknown key `{field}` in {section}; did you mean WALGIT__{}?",
+                fixed.join("__").to_ascii_uppercase()
+            )
+        }
+        None => format!("unknown key `{field}` in {section}"),
+    }
+}
+
+/// Levenshtein distance; enough to turn a typo'd override into a suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.chars().count()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (cb, pair) in b.chars().zip(prev.windows(2)) {
+            let left = cur.last().copied().unwrap_or_default();
+            if let [diag, up] = pair {
+                cur.push((diag + usize::from(ca != cb)).min(up + 1).min(left + 1));
+            }
+        }
+        prev = cur;
+    }
+    prev.last().copied().unwrap_or_default()
+}
+
 /// `owner/name` matches an entry of `list` (`owner/name`, `owner/*`, `*`; `.git` tolerated).
 /// The `placement` table as the env overrides alone set it (None when no
 /// `WALGIT__PLACEMENT__*` variable was present).
@@ -876,7 +957,6 @@ impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             mode: AuthMode::None,
-            unauthenticated_public_bind: false,
             anonymous_read: true,
             tokens: vec![],
             issuer: String::new(),
@@ -892,6 +972,7 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_hours(2160),
             oauth_client_id: None,
             oauth_client_secret: None,
+            proxy_secret_env: None,
         }
     }
 }
@@ -921,6 +1002,17 @@ impl Default for GcsConfig {
         }
     }
 }
+impl Default for AzureConfig {
+    fn default() -> Self {
+        AzureConfig {
+            account: String::new(),
+            endpoint: String::new(),
+            sas_token_env: "AZURE_STORAGE_SAS_TOKEN".into(),
+            credential: AzureCredential::default(),
+            max_concurrent_blocks: 8,
+        }
+    }
+}
 impl Default for S3Config {
     fn default() -> Self {
         S3Config {
@@ -929,16 +1021,6 @@ impl Default for S3Config {
             access_key_env: "AWS_ACCESS_KEY_ID".into(),
             secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
             force_path_style: true,
-        }
-    }
-}
-impl Default for AzureConfig {
-    fn default() -> Self {
-        AzureConfig {
-            auth: AzureAuth::SharedKey,
-            connection_string_env: "AZURE_STORAGE_CONNECTION_STRING".into(),
-            account: String::new(),
-            endpoint: String::new(),
         }
     }
 }
@@ -1037,29 +1119,17 @@ impl Config {
     /// Apply `WALGIT__a__b=v` overrides (values parsed as TOML values, falling back to string)
     /// and a serverless host's `PORT`.
     ///
-    /// Config and image are released independently (the ssd-host host follows
-    /// the serving image's version): an override for a key **unknown to this build**
-    /// (or with an unparsable value) is **ignored with a WARN**, never a
-    /// startup failure (2026-08-21: `unknown field disk_high_watermark`
-    /// crash-looped a host running the previous image). The ignored keys are
-    /// returned by [`apply_env_report`].
+    /// Fails closed, like an unknown key in the file (`deny_unknown_fields`): an override this
+    /// build cannot apply — a malformed name, an unknown section or key (a typo, or a key from
+    /// a newer build), a value of the wrong type — is an error naming every such variable (and
+    /// the nearest known key), and nothing is applied. A typo'd `WALGIT__SERVER__LSITEN` used
+    /// to be a WARN while the host ran on the default. Validate an env file against the binary
+    /// that will run before rolling either out: `walgit config check --env-file`.
     pub fn apply_env(&mut self, vars: impl Iterator<Item = (String, String)>) -> Result<()> {
-        let ignored = self.apply_env_report(vars)?;
-        for (k, why) in &ignored {
-            tracing::warn!(key = %k, reason = %why, "ignoring {k}: unknown in this build");
-        }
-        Ok(())
-    }
-
-    /// [`apply_env`] returning the `(key, reason)` pairs it had to ignore.
-    pub fn apply_env_report(
-        &mut self,
-        vars: impl Iterator<Item = (String, String)>,
-    ) -> Result<Vec<(String, String)>> {
         let mut vars_seen: Vec<String> = Vec::new();
         let mut doc: toml::Table = toml::Table::try_from(&*self).context("serializing config")?;
         let mut touched = false;
-        let mut ignored = Vec::new();
+        let mut refused = Vec::new();
         let mut port_override = None;
         for (k, v) in vars {
             if k == "PORT" {
@@ -1071,14 +1141,17 @@ impl Config {
             };
             vars_seen.push(k.clone());
             let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
-            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
+            if path.iter().any(std::string::String::is_empty) {
+                refused.push(format!(
+                    "{k}: not a configuration path (WALGIT__SECTION__KEY)"
+                ));
                 continue;
             }
             let value: toml::Value = v
                 .parse::<toml::Value>()
                 .unwrap_or(toml::Value::String(v.clone()));
-            // Apply into a copy and type-check it alone: a bad/unknown key is
-            // dropped (WARN) instead of failing every other override with it.
+            // Apply into a copy and type-check it alone, so every unusable
+            // override is named at once, each with its own reason.
             let mut trial = doc.clone();
             let bad = {
                 fn set(
@@ -1102,22 +1175,25 @@ impl Config {
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),
-                    Ok(()) => trial.clone().try_into::<Config>().err().map(|e| {
-                        e.to_string()
-                            .lines()
-                            .next()
-                            .unwrap_or("invalid")
-                            .to_string()
-                    }),
+                    Ok(()) => trial
+                        .clone()
+                        .try_into::<Config>()
+                        .err()
+                        .map(|e| env_override_error(&path, &e.to_string())),
                 }
             };
             if let Some(why) = bad {
-                ignored.push((k, why));
+                refused.push(format!("{k}: {why}"));
             } else {
                 doc = trial;
                 touched = true;
             }
         }
+        anyhow::ensure!(
+            refused.is_empty(),
+            "WALGIT__ environment override(s) this build cannot apply:\n  {}",
+            refused.join("\n  ")
+        );
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
         // replaces the whole section (unset keys = the section's defaults), never
         // merges with the baked file's. 2026-08-21 07:00Z: the image's toml carried
@@ -1145,12 +1221,16 @@ impl Config {
                 *u = rewrite_origin_port(u, port);
             }
         }
-        Ok(ignored)
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
         self.refs.validate()?;
         self.packs.validate()?;
+        anyhow::ensure!(
+            self.server.max_concurrent_per_repo > 0,
+            "server.max_concurrent_per_repo must be positive"
+        );
         anyhow::ensure!(
             self.packfile_uri.uri_min_bytes.as_u64() > 0,
             "packfile_uri.uri_min_bytes must be positive"
@@ -1160,12 +1240,6 @@ impl Config {
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
-        anyhow::ensure!(
-            self.store.backend != StoreBackend::Azure
-                || self.store.azure.auth != AzureAuth::WorkloadIdentity
-                || !self.store.azure.account.is_empty(),
-            "store.azure.account must be set with auth = workload_identity"
-        );
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1253,8 +1327,8 @@ impl Config {
         let a = &self.server.auth;
         if a.mode == AuthMode::None {
             anyhow::ensure!(
-                self.server.listen.ip().is_loopback() || a.unauthenticated_public_bind,
-                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind, or set server.auth.unauthenticated_public_bind behind an authenticating front",
+                self.server.listen.ip().is_loopback(),
+                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
                 self.server.listen
             );
         }
@@ -1311,6 +1385,35 @@ impl Config {
             anyhow::ensure!(
                 !oauth_id || a.session_secret.as_deref().is_some_and(|s| !s.is_empty()),
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
+            );
+        }
+        if a.mode == AuthMode::Proxy {
+            anyhow::ensure!(
+                !a.anonymous_read,
+                "server.auth.anonymous_read must be false in proxy mode (the proxy names every caller)"
+            );
+            // Anything that would let a request in without the proxy — or grant more than
+            // the proxy asserted — is refused rather than silently ignored.
+            anyhow::ensure!(
+                a.tokens.is_empty() && a.trusted_forwarders.is_empty(),
+                "server.auth.tokens and trusted_forwarders are not read in proxy mode (the proxy asserts every identity); remove them"
+            );
+            anyhow::ensure!(
+                a.admin_emails.is_empty() && a.admin_domains.is_empty(),
+                "server.auth.admin_emails/admin_domains are not read in proxy mode (admin comes from `X-Walgit-Access: admin`); remove them"
+            );
+            // The trust boundary: anyone who can reach the port could send the identity
+            // headers — on loopback too, where every container of a pod shares the interface —
+            // so the proxy must prove itself with a shared secret.
+            anyhow::ensure!(
+                a.proxy_secret_env.as_deref().is_some_and(|v| !v.is_empty()),
+                "server.auth.proxy_secret_env is required in proxy mode (a loopback listen is shared by every process in the network namespace, so it does not identify the proxy)"
+            );
+        } else {
+            anyhow::ensure!(
+                a.proxy_secret_env.is_none(),
+                "server.auth.proxy_secret_env is only read in proxy mode (got mode = {:?})",
+                a.mode
             );
         }
         anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
@@ -1433,9 +1536,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_per_repo_concurrency_is_rejected() {
+        let mut c = Config::default();
+        c.server.max_concurrent_per_repo = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.max_concurrent_per_repo must be positive"));
+    }
+
+    #[test]
     fn example_configurations_parse_and_validate() {
-        Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
+        let example = Config::parse(include_str!("../../../walgit.example.toml")).unwrap();
         Config::parse(include_str!("../../../walgit.standalone.toml")).unwrap();
+        // The example documents defaults; `[store.s3]` once showed AWS values instead.
+        assert_eq!(
+            toml::to_string(&example.store.s3).unwrap(),
+            toml::to_string(&S3Config::default()).unwrap()
+        );
     }
 
     #[test]
@@ -1516,16 +1632,6 @@ mod tests {
         assert_eq!(c.placement.serve_exclude, vec!["acme/monorepo"]);
     }
 
-    #[test]
-    fn azure_workload_identity_needs_an_account() {
-        let base = "[store]\nbackend = \"azure\"\nbucket = \"b\"\n[store.azure]\nauth = \"workload_identity\"\n";
-        let err = Config::parse(base).unwrap_err();
-        assert!(err.to_string().contains("store.azure.account"), "{err}");
-        let c = Config::parse(&format!("{base}account = \"acct\"\n")).unwrap();
-        assert_eq!(c.store.azure.auth, AzureAuth::WorkloadIdentity);
-        assert_eq!(c.store.azure.account, "acct");
-    }
-
     /// You cannot maintain what you refuse to serve.
     #[test]
     fn validate_refuses_maintaining_a_repo_the_host_does_not_serve() {
@@ -1556,50 +1662,65 @@ mod tests {
         c.validate().unwrap();
     }
 
-    /// Config and image release independently: an override for a key this
-    /// build does not know (or a value it cannot parse) is ignored and
-    /// reported, the known ones still apply, startup continues.
+    /// An override this build cannot apply fails closed, like an unknown key in the
+    /// file: every such variable is named (with the nearest key for a typo), and none
+    /// of the batch is applied — not even the valid ones.
     #[test]
-    fn env_override_unknown_key_is_ignored_not_fatal() {
+    fn env_override_this_build_cannot_apply_is_an_error() {
         let mut c = Config::default();
-        let ignored = c
-            .apply_env_report(
+        let err = c
+            .apply_env(
                 vec![
+                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
                     (
-                        "WALGIT__CACHE__NOT_A_KEY_YET".to_string(),
-                        "0.9".to_string(),
+                        "WALGIT__SERVER__LSITEN".to_string(),
+                        "0.0.0.0:9".to_string(),
                     ),
                     (
                         "WALGIT__WAL__MAX_BATCH".to_string(),
                         "not-a-number".to_string(),
                     ),
                     ("WALGIT__NOSUCHSECTION__X".to_string(), "1".to_string()),
-                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
+                    ("WALGIT__CACHE____DIR".to_string(), "/x".to_string()),
                 ]
                 .into_iter(),
             )
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "WALGIT__SERVER__LSITEN: unknown key `lsiten` in [server]; did you mean WALGIT__SERVER__LISTEN?"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("WALGIT__WAL__MAX_BATCH: "), "{err}");
+        assert!(
+            err.contains("WALGIT__NOSUCHSECTION__X: unknown key `nosuchsection` in the top level"),
+            "{err}"
+        );
+        assert!(!err.contains("did you mean WALGIT__NOSUCHSECTION"), "{err}");
+        assert!(
+            err.contains("WALGIT__CACHE____DIR: not a configuration path"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("BATCH_WINDOW"),
+            "a valid override is not refused: {err}"
+        );
         assert_eq!(
             c.wal.batch_window,
-            Duration::from_millis(30),
-            "known override still applied"
+            Config::default().wal.batch_window,
+            "nothing applied from a refused batch"
         );
-        let keys: Vec<&str> = ignored.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "WALGIT__CACHE__NOT_A_KEY_YET",
-                "WALGIT__WAL__MAX_BATCH",
-                "WALGIT__NOSUCHSECTION__X"
-            ]
+        assert_eq!(c.server.listen, Config::default().server.listen);
+        // `Config::parse` (startup) reads the process env through the same path.
+        let mut c = Config::default();
+        assert!(
+            c.apply_env(vec![("WALGIT__GIT__BINARI".to_string(), "g".to_string())].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("did you mean WALGIT__GIT__BINARY?")
         );
-        assert!(ignored[0].1.contains("unknown field"), "{:?}", ignored[0]);
-        // Plain apply_env is the same, just warns.
-        let mut c2 = Config::default();
-        c2.apply_env(
-            vec![("WALGIT__CACHE__NOT_A_KEY_YET".to_string(), "1".to_string())].into_iter(),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -1746,17 +1867,64 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
-        // ... unless the deployment says a front authenticates (D53).
-        let fronted = Config::parse(
-            "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\nunauthenticated_public_bind = true\n",
-        )
-        .unwrap();
-        assert!(fronted.server.auth.unauthenticated_public_bind);
         // The issuer is an oidc-only requirement: none and token mode validate without one.
         let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
         assert_eq!(none.server.auth.issuer, "");
         let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
         assert_eq!(tok.server.auth.issuer, "");
+    }
+
+    #[test]
+    fn proxy_mode_needs_a_secret_and_nothing_else_that_grants_access() {
+        let parse = |server: &str, auth: &str| {
+            Config::parse(&format!(
+                "[store]\nbucket = \"b\"\n[server]\n{server}\n[server.auth]\nmode = \"proxy\"\nanonymous_read = false\n{auth}\n"
+            ))
+        };
+        // Without a secret anything that can reach the port could name any caller: a public
+        // bind, and loopback too (the sidecar shape — every container of the pod shares it).
+        for listen in ["0.0.0.0:8080", "127.0.0.1:8080", "[::1]:8080"] {
+            for secret in ["", "proxy_secret_env = \"\""] {
+                let err = parse(&format!("listen = \"{listen}\""), secret).unwrap_err();
+                assert!(
+                    err.to_string().contains("proxy_secret_env"),
+                    "{listen}: {err}"
+                );
+            }
+        }
+        for listen in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+            let ok = parse(
+                &format!("listen = \"{listen}\""),
+                "proxy_secret_env = \"WALGIT_PROXY_SECRET\"",
+            )
+            .unwrap();
+            assert_eq!(ok.server.auth.mode, AuthMode::Proxy);
+            assert_eq!(
+                ok.server.auth.proxy_secret_env.as_deref(),
+                Some("WALGIT_PROXY_SECRET")
+            );
+        }
+        // No anonymous access, and no second way in or implicit admin beside the proxy.
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"proxy\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("anonymous_read"), "{err}");
+        for extra in [
+            "tokens = [{ principal = \"ci\", token = \"s\" }]",
+            "trusted_forwarders = [\"front\"]",
+            "admin_emails = [\"a@example.com\"]",
+            "admin_domains = [\"example.com\"]",
+        ] {
+            let err = parse("", &format!("proxy_secret_env = \"S\"\n{extra}")).unwrap_err();
+            assert!(
+                !err.to_string().contains("proxy_secret_env"),
+                "{extra}: {err}"
+            );
+        }
+        // The secret is a proxy-mode key only.
+        let err =
+            Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nproxy_secret_env = \"X\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("only read in proxy mode"), "{err}");
     }
 
     #[test]

@@ -228,6 +228,7 @@ Top-level namespaces.
 
 Sorted, `[]` if none. Must come from the authoritative repo list (walgit
 lists the object store, not local disk, so a cold node sees everything).
+Only owners in the caller's scope (`proxy` mode's `X-Walgit-Owners`, AGENTS.md §1.3).
 Cache: SWR (§2a).
 
 ### `GET /api/v1/owners/{owner}/repos`
@@ -238,7 +239,7 @@ Repositories under one owner, short names only.
 ["hello", "walgit"]
 ```
 
-Sorted, `[]` for an unknown/empty owner (200, not 404). Cache: SWR.
+Sorted, `[]` for an unknown/empty owner or one outside the caller's scope (200, not 404). Cache: SWR.
 
 ### `GET /api/v1/me`
 
@@ -538,3 +539,8 @@ GET /o/r/api/commit/deadbeef                    → 404 text/plain
 GET /o/r/tree/main/anything                              → 200 index.html
 GET /o/r/settings                                        → 200 index.html  (JSON is /o/r/api/settings)
 ```
+
+The authentication popup accepts `?origin=<opener-origin>` only for a configured
+CORS origin. Without it, notification targets the popup's own origin. The SDK
+supplies its origin for cross-origin use and checks both the sending origin and
+the opened window. Identity notifications never use a wildcard target.

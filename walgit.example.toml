@@ -2,10 +2,11 @@
 #
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
-# Validate with: walgit --config walgit.toml config check
+# An override this build cannot apply (unknown key, wrong type) is a startup error, like an unknown key here.
+# Validate with: walgit --config walgit.toml config check [--env-file host.env]
 
 [server]
-listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
+listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc/proxy.
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
@@ -43,15 +44,16 @@ mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (gene
 # hostnames = ["git.example.com"] # self_signed SANs; empty = localhost, *.localhost, 127.0.0.1, ::1 + public_url's host
 
 [server.auth]
-mode = "none"                     # "none" | "token" | "oidc"
-unauthenticated_public_bind = false # none mode on a non-loopback listen: only behind a front that authenticates every
-                                  # request and names the user in X-Walgit-Principal (recorded as the push author); the
-                                  # front must overwrite any X-Walgit-Principal a client sends
+mode = "none"                     # "none" | "token" | "oidc" | "proxy"
                                   #   none  — everyone is `anon` with write+admin; loopback listen only
                                   #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
                                   #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
                                   #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
-anonymous_read = true             # must be false in oidc mode
+                                  #   proxy — an identity-aware proxy in front authenticates and authorizes every request and
+                                  #           asserts X-Walgit-Principal, X-Walgit-Access (read|write|admin, required) and
+                                  #           optionally X-Walgit-Owners (owner[,owner…] or *; others then 404). The proxy must
+                                  #           strip these headers from clients. No tokens, trusted_forwarders or admin_* here.
+anonymous_read = true             # must be false in oidc and proxy mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
@@ -71,29 +73,29 @@ anonymous_read = true             # must be false in oidc mode
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+# proxy_secret_env = "WALGIT_PROXY_SECRET"   # proxy: env var holding the secret the proxy sends as X-Walgit-Proxy-Secret;
+#                                          #        required, loopback listen included (a sidecar's pod shares loopback).
+#                                          #        Trimmed (a trailing newline is fine), >= 32 bytes; unset/blank/short
+#                                          #        at startup = the server refuses to start. Wrong/missing on a request
+#                                          #        = 403 naming the proxy (never 401: git would drop the user's token).
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "azure" | "memory" (tests)
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "azure" (build feature) | "memory" (tests)
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket
-max_retries = 8                   # retries on retryable store errors (jittered backoff)
+max_retries = 8                   # extra attempts for transient reads only (jittered backoff; writes/deletes are single-attempt; 0 disables)
 multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
 multipart_part_size = "32MiB"
 
 [store.s3]
-endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
+endpoint = "http://127.0.0.1:9000"       # the local rustfs/MinIO rig; AWS: "https://s3.<region>.amazonaws.com"
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
+access_key_env = "AWS_ACCESS_KEY_ID"     # explicit pair overrides the default chain; AWS_SESSION_TOKEN is also honored
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
-force_path_style = false          # true for most self-hosted S3 implementations
-
-[store.azure]                     # bucket = the container
-auth = "shared_key"               # "shared_key" | "workload_identity"
-connection_string_env = "AZURE_STORAGE_CONNECTION_STRING" # shared_key: env var with AccountName, AccountKey (+ BlobEndpoint for Azurite)
-account = ""                      # workload_identity: the storage account name (required)
-endpoint = ""                     # workload_identity: blob endpoint; empty = https://<account>.blob.core.windows.net
-                                  # workload_identity reads AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and
-                                  # AZURE_AUTHORITY_HOST (as injected by AKS); the identity needs Storage Blob Data Contributor
+# Leave both key variables unset for AWS profiles, web identity / IRSA, container or instance roles.
+# Credentials from the default chain refresh automatically. An incomplete or empty explicit pair is an error.
+force_path_style = true           # path-style `endpoint/bucket/key`, what rustfs/MinIO/Ceph need; on AWS set false
+                                  # for virtual-hosted `bucket.endpoint/key`, AWS's addressing
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
@@ -101,6 +103,20 @@ direct_connectivity = true
 # signing_service_account = "sa@project.iam.gserviceaccount.com"   # for lfs serve_via = "signed_url"
 bulk_clients = 4                  # separate data channels for pack/idx/side-file/LFS bytes + ranged reads
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
+
+[store.azure]                    # build with --features walgit-store/azure; store.bucket is the container
+account = ""                    # derives https://<account>.blob.core.windows.net
+endpoint = ""                   # optional override, e.g. http://127.0.0.1:10000/devstoreaccount1
+credential = "auto"              # workload identity when AZURE_FEDERATED_TOKEN_FILE is set, otherwise managed identity
+                                # or "workload_identity", "managed_identity", "azure_cli" (explicit local az login),
+                                # "client_secret" (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET)
+                                # managed identity honors AZURE_CLIENT_ID for a user-assigned identity
+sas_token_env = "AZURE_STORAGE_SAS_TOKEN" # optional override for emulator tests; unset in identity-based deployments
+max_concurrent_blocks = 8        # upload memory bounded by concurrency × multipart_part_size + one input chunk
+# multipart_part_size must be 1 byte..4000 MiB; uploads may contain at most 50,000 blocks.
+# lfs serve_via = "signed_url" and edge offload (server.accel_redirect) use read-only user-delegation SAS URLs under
+# identity auth: the identity needs "Storage Blob Delegator" on the account, and a custom endpoint needs account set
+# too. SAS-token auth serves LFS via proxy and hands the edge the configured SAS.
 
 [cache]
 dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)

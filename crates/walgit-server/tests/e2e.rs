@@ -16,6 +16,36 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+async fn request_object_info(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    oids: &[String],
+) -> anyhow::Result<reqwest::Response> {
+    let mut body = Vec::new();
+    walgit_server::pktline::encode_text(&mut body, "command=object-info\n");
+    walgit_server::pktline::encode_delim(&mut body);
+    walgit_server::pktline::encode_text(&mut body, "size\n");
+    for oid in oids {
+        walgit_server::pktline::encode_text(&mut body, &format!("oid {oid}\n"));
+    }
+    walgit_server::pktline::encode_flush(&mut body);
+
+    Ok(reqwest::Client::new()
+        .post(format!(
+            "{}/{owner}/{repo}.git/git-upload-pack",
+            server.base_url
+        ))
+        .header("Git-Protocol", "version=2")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-git-upload-pack-request",
+        )
+        .body(body)
+        .send()
+        .await?)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn info_refs_v2_advertises_capabilities() -> TestResult {
     let server = Server::start().await?;
@@ -30,7 +60,180 @@ async fn info_refs_v2_advertises_capabilities() -> TestResult {
     assert!(out.contains("version 2"));
     assert!(out.contains("ls-refs=unborn"));
     assert!(out.contains("fetch=shallow wait-for-done"));
+    assert!(out.contains("object-info=size"));
+    assert!(!out.contains("object-info\n"), "{out}");
     assert!(!out.contains("bundle-uri"), "{out}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_reports_object_size() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "object-info"),
+        ],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let oid = git_in(&src, &["rev-parse", "main"])?;
+    let size = git_in(&src, &["cat-file", "-s", oid.trim()])?;
+
+    let response =
+        request_object_info(&server, "t", "object-info", &[oid.trim().to_owned()]).await?;
+    assert!(response.status().is_success());
+    let response = response.bytes().await?;
+    let expected = format!("{} {}\n", oid.trim(), size.trim());
+    assert!(
+        response
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_reports_missing_object_with_empty_size() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info-missing").await?;
+    let missing = "0000000000000000000000000000000000000000".to_string();
+
+    let response = request_object_info(
+        &server,
+        "t",
+        "object-info-missing",
+        std::slice::from_ref(&missing),
+    )
+    .await?;
+    assert!(response.status().is_success());
+    let response = response.bytes().await?;
+    let expected = format!("{missing} \n");
+    assert!(
+        response
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(!response.windows(3).any(|window| window == b"-1\n"));
+    Ok(())
+}
+
+/// An object pushed after a lookup missed it is reported with its size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_finds_an_object_pushed_after_a_miss() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info-later").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "object-info-later"),
+        ],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    git_in(
+        &src,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "later",
+        ],
+    )?;
+    let oid = git_in(&src, &["rev-parse", "main"])?.trim().to_owned();
+    let size = git_in(&src, &["cat-file", "-s", &oid])?.trim().to_owned();
+
+    let before = request_object_info(
+        &server,
+        "t",
+        "object-info-later",
+        std::slice::from_ref(&oid),
+    )
+    .await?
+    .bytes()
+    .await?;
+    let missing = format!("{oid} \n");
+    assert!(
+        before
+            .windows(missing.len())
+            .any(|w| w == missing.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&before)
+    );
+
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let after = request_object_info(
+        &server,
+        "t",
+        "object-info-later",
+        std::slice::from_ref(&oid),
+    )
+    .await?
+    .bytes()
+    .await?;
+    let found = format!("{oid} {size}\n");
+    assert!(
+        after.windows(found.len()).any(|w| w == found.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&after)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_bounds_oid_count_before_sync() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info-limit").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "object-info-limit"),
+        ],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let oid = git_in(&src, &["rev-parse", "main"])?.trim().to_owned();
+
+    let accepted = vec![oid.clone(); 10_000];
+    let response = request_object_info(&server, "t", "object-info-limit", &accepted).await?;
+    assert!(response.status().is_success());
+    let body = response.bytes().await?;
+    assert!(!String::from_utf8_lossy(&body).contains("ERR "));
+
+    let refused = vec![oid; 10_001];
+    let response = request_object_info(&server, "t", "object-info-limit", &refused).await?;
+    assert!(response.status().is_success());
+    let body = response.text().await?;
+    assert!(
+        body.contains("ERR walgit: object-info request has 10001 object ids"),
+        "{body}"
+    );
+    let tasks = server
+        .get_text("/t/object-info-limit/api/tasks", &[])
+        .await?;
+    assert!(
+        !tasks.contains("materialize") && !tasks.contains("remote-index"),
+        "oversized object-info did not start object sync: {tasks}"
+    );
     Ok(())
 }
 
@@ -295,6 +498,66 @@ async fn admin_create_list_delete() -> TestResult {
         .send()
         .await?;
     assert_eq!(del_again.status(), 404);
+    Ok(())
+}
+
+/// `PUT /{owner}/{repo}` answers from the bucket: 201 once, then 409 — on the
+/// instance holding the handle (warm) and on one that never opened it (cold);
+/// concurrent creates of one name have one 201 and one 409, on one instance
+/// and across two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_answers_409_for_an_existing_repository() -> TestResult {
+    let (a, b) = Server::start_pair().await?;
+    let client = reqwest::Client::new();
+    let put = |s: &Server, repo: &str| client.put(format!("{}/t/{repo}", s.base_url)).send();
+    assert_eq!(put(&a, "r").await?.status(), 201);
+    assert_eq!(put(&a, "r").await?.status(), 409, "warm handle");
+    assert_eq!(put(&b, "r").await?.status(), 409, "cold instance");
+    // Deleted on B while A still holds a handle: the bucket, not A's map, answers.
+    assert_eq!(
+        client
+            .delete(format!("{}/t/r", b.base_url))
+            .send()
+            .await?
+            .status(),
+        204
+    );
+    assert_eq!(
+        put(&a, "r").await?.status(),
+        201,
+        "re-create after a delete elsewhere"
+    );
+
+    for (n, (x, y)) in [(&a, &a), (&a, &b)].into_iter().enumerate() {
+        let repo = format!("race{n}");
+        let (rx, ry) = tokio::join!(put(x, &repo), put(y, &repo));
+        let mut codes = [rx?.status().as_u16(), ry?.status().as_u16()];
+        codes.sort_unstable();
+        assert_eq!(codes, [201, 409], "{repo}");
+    }
+    Ok(())
+}
+
+/// `auto_create_on_push`: a push to a missing name creates it (its internal
+/// create treats "exists" as fine), and a create after that is a 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_create_on_push_creates_the_repository() -> TestResult {
+    let server = Server::start_with_tweak(|c| c.server.auto_create_on_push = true).await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    for refspec in ["HEAD:refs/heads/main", "HEAD:refs/heads/second"] {
+        git_in(&src, &["push", &server.repo_url("t", "auto"), refspec])?;
+    }
+    let refs = server.ls_remote("t", "auto").await?;
+    assert!(
+        refs.contains("refs/heads/main") && refs.contains("refs/heads/second"),
+        "{refs}"
+    );
+    let status = reqwest::Client::new()
+        .put(format!("{}/t/auto", server.base_url))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, 409);
     Ok(())
 }
 
@@ -1193,6 +1456,19 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
             c.cache.max_bytes = bytesize::ByteSize::b(remote_pack.pack_size / 2);
         })
         .await?;
+    let base_tip_size = git_in(&src, &["cat-file", "-s", &base_tip])?;
+    let response =
+        request_object_info(&small, "t", "rbase", std::slice::from_ref(&base_tip)).await?;
+    assert!(response.status().is_success());
+    let response = response.bytes().await?;
+    let expected = format!("{} {}\n", base_tip, base_tip_size.trim());
+    assert!(
+        response
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
     let url = small.repo_url("t", "rbase");
     git_in(clone.path(), &["remote", "set-url", "origin", &url])?;
     let fetch = std::process::Command::new("git")

@@ -21,21 +21,14 @@
 //!
 //! ## Conditional DELETE
 //!
-//! S3 has no native conditional delete. We emulate via HEAD (read `ETag`) +
-//! compare + DELETE, documenting the inherent check-then-act race: a
-//! concurrent writer could replace the object between HEAD and DELETE.
-//! Acceptable for walgit's lease-guarded semantics.
+//! Conditional DELETE uses native `If-Match` at the storage linearization point.
+//! Never substitute a HEAD followed by an unconditional delete.
 //!
 //! ## Multipart upload
 //!
-//! Objects above `cfg.multipart_threshold` use `CreateMultipartUpload` +
-//! `UploadPart` + `CompleteMultipartUpload`. `CreateMultipartUpload` does NOT
-//! support `If-None-Match`/`If-Match` in the S3 API, so multipart is only
-//! used for `PutMode::Overwrite`. For walgit's immutable pack objects
-//! (`PutMode::Create`) we use single-shot PUT when the object is large,
-//! accepting the (tiny) risk of concurrent create races. CAS-rewritten
-//! objects (manifests, leases, bundle lists) are always small → single-shot
-//! PUT with conditional headers.
+//! Objects above `cfg.multipart_threshold` use staged multipart uploads.
+//! Create/update conditions apply at completion, when the destination becomes visible.
+//! Providers must honor these conditions; errors never trigger an unconditional retry.
 //!
 //! ## rustfs compatibility (tested with rustfs/rustfs:latest)
 //!
@@ -45,7 +38,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, ProvideCredentials};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use bytes::Bytes;
@@ -58,55 +51,96 @@ use crate::{
 
 /// S3-compatible object store.
 pub struct S3Store {
+    /// Mutations are deliberately single-attempt: retrying a conditional write
+    /// can turn a landed CAS with a lost response into a false 412.
     client: S3Client,
+    /// Idempotent metadata reads use the configured retry budget.
+    read_client: S3Client,
     bucket: String,
     /// reqwest client for streaming GETs via presigned URLs.
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    max_retries: u32,
 }
 
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// Credentials are read from the env vars named in
-    /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
-    /// `AWS_SESSION_TOKEN` when present.
-    pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
-        })?;
-        let secret_key = std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
-        })?;
-
-        let creds = static_credentials(
-            &access_key,
-            &secret_key,
-            std::env::var("AWS_SESSION_TOKEN").ok(),
-        );
+    /// The env vars named in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
+    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) override, plus
+    /// `AWS_SESSION_TOKEN` when present. When both key variables are unset,
+    /// the AWS default chain resolves and refreshes credentials (including
+    /// projected service-account tokens / IRSA). A partial or empty explicit
+    /// key pair is an error, not a fallback to another identity.
+    pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
-        let mut s3_config = aws_sdk_s3::Config::builder()
-            .region(region)
-            .credentials_provider(creds)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
+        let credentials = match (
+            std::env::var(&cfg.s3.access_key_env),
+            std::env::var(&cfg.s3.secret_key_env),
+        ) {
+            (Ok(access_key), Ok(secret_key))
+                if !access_key.is_empty() && !secret_key.is_empty() =>
+            {
+                aws_sdk_s3::config::SharedCredentialsProvider::new(static_credentials(
+                    &access_key,
+                    &secret_key,
+                    std::env::var("AWS_SESSION_TOKEN").ok(),
+                ))
+            }
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+                let chain =
+                    aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                        .region(region.clone())
+                        .build()
+                        .await;
+                // Resolve once now, so a host with no AWS identity fails at startup
+                // with the chain's own reason rather than on the first request,
+                // after the profile and IMDS lookups have timed out.
+                chain.provide_credentials().await.map_err(|e| {
+                    anyhow::anyhow!("s3: the AWS default credential chain resolved nothing: {e}")
+                })?;
+                aws_sdk_s3::config::SharedCredentialsProvider::new(chain)
+            }
+            _ => anyhow::bail!(
+                "set both {} and {} to non-empty credentials, or leave both unset for the AWS default credential chain",
+                cfg.s3.access_key_env,
+                cfg.s3.secret_key_env,
+            ),
+        };
 
-        if !cfg.s3.endpoint.is_empty() {
-            s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
-        }
+        let build_config = |retry_config| {
+            let mut s3_config = aws_sdk_s3::Config::builder()
+                .region(region.clone())
+                .credentials_provider(credentials.clone())
+                .force_path_style(cfg.s3.force_path_style)
+                .retry_config(retry_config)
+                .behavior_version_latest();
 
-        let client = S3Client::from_conf(s3_config.build());
+            if !cfg.s3.endpoint.is_empty() {
+                s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
+            }
+            s3_config.build()
+        };
+
+        let client = S3Client::from_conf(build_config(
+            aws_sdk_s3::config::retry::RetryConfig::disabled(),
+        ));
+        let read_client = S3Client::from_conf(build_config(
+            aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(cfg.max_retries.saturating_add(1)),
+        ));
         let http = reqwest::Client::builder().build()?;
 
         Ok(S3Store {
             client,
+            read_client,
             bucket: cfg.bucket.clone(),
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            max_retries: cfg.max_retries,
         })
     }
 
@@ -138,14 +172,42 @@ impl S3Store {
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning get: {e}")))?;
 
-        let mut req = self.http.get(presigned.uri());
-        for (name, value) in presigned.headers() {
-            req = req.header(name, value);
+        let mut attempt = 0u32;
+        loop {
+            let mut req = self.http.get(presigned.uri());
+            for (name, value) in presigned.headers() {
+                req = req.header(name, value);
+            }
+            match req.send().await {
+                Ok(response)
+                    if matches!(response.status().as_u16(), 429 | 500..=599)
+                        && attempt < self.max_retries =>
+                {
+                    tracing::warn!(
+                        key,
+                        attempt,
+                        status = %response.status(),
+                        "retrying transient s3 get"
+                    );
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < self.max_retries => {
+                    tracing::warn!(key, attempt, %error, "retrying failed s3 get");
+                }
+                Err(error) => {
+                    return Err(StoreError::retryable(anyhow::anyhow!(
+                        "s3 get http: {error}"
+                    )));
+                }
+            }
+            let delay = util::backoff(
+                attempt,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
+            );
+            attempt += 1;
+            tokio::time::sleep(delay).await;
         }
-
-        req.send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 get http: {e}")))
     }
 
     fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
@@ -337,7 +399,7 @@ impl ObjectStore for S3Store {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let resp = self
-            .client
+            .read_client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
@@ -369,11 +431,8 @@ impl ObjectStore for S3Store {
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let (s3_body, len) = body_to_s3(body).await?;
 
-        // Multipart only for Overwrite (CreateMultipartUpload has no
-        // conditional header support in the S3 API). Create/Update always
-        // use single-shot PUT.
-        let use_multipart =
-            len > self.multipart_threshold && matches!(opts.mode, PutMode::Overwrite);
+        // Conditions apply to the final publication, not staging.
+        let use_multipart = len > self.multipart_threshold;
 
         if use_multipart {
             return self.multipart_put(key, s3_body, len, &opts).await;
@@ -425,34 +484,48 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
-            // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
-            let head = self.head(key).await?;
-            match head {
-                None => return Err(StoreError::NotFound { key: key.into() }),
-                Some(meta) if &meta.version != want => {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: Some(meta.version),
-                    });
-                }
-                _ => {}
-            }
+            request = request.if_match(want.as_str());
         }
-
-        let resp = self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
+        let resp = request.send().await;
 
         match resp {
             Ok(_) => Ok(()),
             Err(err) => {
+                if err
+                    .raw_response()
+                    .is_some_and(|r| r.status().as_u16() == 404)
+                    || matches!(err_code(&err), Some("NoSuchKey" | "NotFound"))
+                {
+                    return if if_version.is_some() {
+                        Err(StoreError::NotFound { key: key.into() })
+                    } else {
+                        Ok(())
+                    };
+                }
+
+                if err
+                    .raw_response()
+                    .is_some_and(|r| r.status().as_u16() == 412)
+                    || matches!(
+                        err_code(&err),
+                        Some("PreconditionFailed" | "ConditionalRequestConflict")
+                    )
+                {
+                    // Compatible services may use 412 for an absent key too.
+                    // Probe only after the atomic delete has already refused.
+                    let current = match self.head(key).await {
+                        Ok(None) => return Err(StoreError::NotFound { key: key.into() }),
+                        Ok(Some(meta)) => Some(meta.version),
+                        Err(_) => None,
+                    };
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current,
+                    });
+                }
+
                 // S3 DeleteObject is idempotent: deleting a non-existent key
                 // returns Ok, not an error. If we get here, it's a real error.
                 // For unconditional deletes we treat any error as transient.
@@ -476,7 +549,7 @@ impl ObjectStore for S3Store {
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let client = self.client.clone();
+        let client = self.read_client.clone();
         let bucket = self.bucket.clone();
         let prefix = prefix.to_owned();
         let start_after = start_after.map(std::borrow::ToOwned::to_owned);
@@ -556,7 +629,7 @@ impl ObjectStore for S3Store {
         let mut continuation_token: Option<String> = None;
         loop {
             let mut builder = self
-                .client
+                .read_client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix)
@@ -622,14 +695,6 @@ impl ObjectStore for S3Store {
             return Err(StoreError::InvalidArgument(
                 "compose needs at least one source".into(),
             ));
-        }
-        if let PutMode::Create = opts.mode
-            && self.head(dest).await?.is_some()
-        {
-            return Err(StoreError::PreconditionFailed {
-                key: dest.to_owned(),
-                current: None,
-            });
         }
         // Sizes first: the layout of parts depends on them.
         let mut sizes = Vec::with_capacity(sources.len());
@@ -782,19 +847,33 @@ impl ObjectStore for S3Store {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
-        let resp = match self
+        let complete = self
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(dest)
             .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-        {
+            .multipart_upload(completed);
+        let complete = match &opts.mode {
+            PutMode::Overwrite => complete,
+            PutMode::Create => complete.if_none_match("*"),
+            PutMode::Update(v) => complete.if_match(v.as_str()),
+        };
+        let resp = match complete.send().await {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(dest, &upload_id).await;
+                if e.raw_response().is_some_and(|r| r.status().as_u16() == 412)
+                    || matches!(
+                        err_code(&e),
+                        Some("PreconditionFailed" | "ConditionalRequestConflict")
+                    )
+                {
+                    return Err(StoreError::PreconditionFailed {
+                        key: dest.into(),
+                        current: None,
+                    });
+                }
                 return Err(classify_error("s3 complete multipart", &e));
             }
         };
@@ -832,7 +911,7 @@ struct ListState {
     buffer: std::vec::IntoIter<Result<ObjectMeta>>,
 }
 
-// ---- multipart upload (Overwrite only) ---------------------------------
+// ---- multipart upload ---------------------------------
 
 impl S3Store {
     async fn multipart_put(
@@ -843,6 +922,11 @@ impl S3Store {
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
         use tokio::io::AsyncReadExt;
+        if self.multipart_part_size == 0 || len.div_ceil(self.multipart_part_size) > 10_000 {
+            return Err(StoreError::InvalidArgument(
+                "S3 upload requires 1..10000 nonempty parts".into(),
+            ));
+        }
 
         let mut create = self
             .client
@@ -852,6 +936,10 @@ impl S3Store {
 
         if let Some(ct) = opts.content_type {
             create = create.content_type(ct);
+        }
+
+        if opts.immutable {
+            create = create.cache_control("public, max-age=31536000, immutable");
         }
 
         let upload = create
@@ -898,8 +986,11 @@ impl S3Store {
                 read_total += n;
             }
 
-            if read_total == 0 {
-                break;
+            if read_total != to_read {
+                let _ = self.abort_multipart(key, &upload_id).await;
+                return Err(StoreError::InvalidArgument(
+                    "S3 upload shorter than declared length".into(),
+                ));
             }
             buf.truncate(read_total);
             let actual = read_total as u64;
@@ -935,23 +1026,54 @@ impl S3Store {
             part_number += 1;
         }
 
+        // Do not commit an input that grew after the caller captured its length.
+        let mut extra = [0u8; 1];
+        match reader.read(&mut extra).await {
+            Ok(0) => {}
+            result => {
+                let _ = self.abort_multipart(key, &upload_id).await;
+                return Err(StoreError::InvalidArgument(
+                    if result.is_ok() {
+                        "S3 upload longer than declared length"
+                    } else {
+                        "S3 upload failed while validating final length"
+                    }
+                    .into(),
+                ));
+            }
+        }
+
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(uploaded_parts))
             .build();
 
-        let resp = match self
+        let complete = self
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
             .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-        {
+            .multipart_upload(completed);
+        let complete = match &opts.mode {
+            PutMode::Overwrite => complete,
+            PutMode::Create => complete.if_none_match("*"),
+            PutMode::Update(v) => complete.if_match(v.as_str()),
+        };
+        let resp = match complete.send().await {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(key, &upload_id).await;
+                if e.raw_response().is_some_and(|r| r.status().as_u16() == 412)
+                    || matches!(
+                        err_code(&e),
+                        Some("PreconditionFailed" | "ConditionalRequestConflict")
+                    )
+                {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: None,
+                    });
+                }
                 return Err(classify_error("s3 complete multipart", &e));
             }
         };
@@ -995,7 +1117,7 @@ fn static_credentials(
 // 5. ListObjectsV2: StartAfter, ContinuationToken, IsTruncated/NextToken OK.
 // 6. DeleteObject: idempotent for absent keys (204).
 // 7. Multipart: CreateMultipartUpload + UploadPart + CompleteMultipartUpload
-//    supported. No conditional headers on Create/Complete (same as real S3).
+//    conditions must be honored at CompleteMultipartUpload.
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
 //    stripped consistently in our Version.
 // 9. force_path_style: required for rustfs local dev.
@@ -1007,18 +1129,283 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
     use aws_sdk_s3::operation::put_object::PutObjectError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ConditionService {
+        requests: Vec<(String, String, Option<String>, Option<String>)>,
+        current: Option<String>,
+    }
+
+    // Models the storage linearization point, including a rival that already
+    // replaced the caller's captured version. Actual SDK requests hit this server.
+    async fn condition_request(
+        axum::extract::State(state): axum::extract::State<
+            std::sync::Arc<parking_lot::Mutex<ConditionService>>,
+        >,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let method = request.method().to_string();
+        let query = request.uri().query().unwrap_or("").to_owned();
+        let matched = request
+            .headers()
+            .get("if-match")
+            .map(|h| h.to_str().unwrap().to_owned());
+        let absent = request
+            .headers()
+            .get("if-none-match")
+            .map(|h| h.to_str().unwrap().to_owned());
+        // Drain the staged body before replying, as a real HTTP server would.
+        axum::body::to_bytes(request.into_body(), 1024)
+            .await
+            .unwrap();
+        let mut state = state.lock();
+        state.requests.push((
+            method.clone(),
+            query.clone(),
+            matched.clone(),
+            absent.clone(),
+        ));
+        if method == "HEAD" {
+            if state.current.is_none() {
+                return axum::http::StatusCode::NOT_FOUND.into_response();
+            }
+            // A HEAD-before-DELETE implementation sees its old token; the rival
+            // is already current when the subsequent delete is evaluated.
+            return (
+                [("etag", "\"captured\""), ("content-length", "5242880")],
+                "",
+            )
+                .into_response();
+        }
+        if method == "POST" && query.starts_with("uploads") {
+            return "<InitiateMultipartUploadResult><UploadId>attempt</UploadId></InitiateMultipartUploadResult>".into_response();
+        }
+        if method == "PUT" {
+            return (
+                [("etag", "\"part\"")],
+                "<CopyPartResult><ETag>\"part\"</ETag></CopyPartResult>",
+            )
+                .into_response();
+        }
+        if method == "DELETE" && query.contains("uploadId") {
+            return axum::http::StatusCode::NO_CONTENT.into_response();
+        }
+        if method == "DELETE" && matched.is_some() && state.current.is_none() {
+            return (
+                axum::http::StatusCode::PRECONDITION_FAILED,
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            )
+                .into_response();
+        }
+        if matched
+            .as_ref()
+            .is_some_and(|v| Some(v) != state.current.as_ref())
+            || (absent.as_deref() == Some("*") && state.current.is_some())
+        {
+            return (
+                axum::http::StatusCode::PRECONDITION_FAILED,
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            )
+                .into_response();
+        }
+        if method == "DELETE" {
+            state.current = None;
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        } else {
+            state.current = Some("published".into());
+            "<CompleteMultipartUploadResult><ETag>\"published\"</ETag></CompleteMultipartUploadResult>".into_response()
+        }
+    }
+
+    async fn condition_store() -> (
+        S3Store,
+        std::sync::Arc<parking_lot::Mutex<ConditionService>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(ConditionService {
+            current: Some("rival".into()),
+            ..Default::default()
+        }));
+        let app = axum::Router::new()
+            .fallback(condition_request)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_sdk_s3::Config::builder()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "synthetic",
+                "synthetic",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .behavior_version_latest()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        (
+            S3Store {
+                client: S3Client::from_conf(config.clone()),
+                read_client: S3Client::from_conf(config),
+                bucket: "bucket".into(),
+                http: reqwest::Client::new(),
+                multipart_threshold: 1,
+                multipart_part_size: 8,
+                max_retries: 0,
+            },
+            state,
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_preserves_rivals_and_only_probes_on_failure() {
+        let (store, state, server) = condition_store().await;
+        assert!(matches!(
+            store.delete("key", Some(Version::new("captured"))).await,
+            Err(StoreError::PreconditionFailed { .. })
+        ));
+        {
+            let state = state.lock();
+            assert_eq!(state.current.as_deref(), Some("rival"));
+            assert_eq!(state.requests.len(), 2);
+            assert_eq!(state.requests[0].0, "DELETE", "no HEAD/check/delete window");
+            assert_eq!(state.requests[1].0, "HEAD", "failure-only probe");
+            assert_eq!(state.requests[0].2.as_deref(), Some("captured"));
+        }
+        store
+            .delete("key", Some(Version::new("rival")))
+            .await
+            .unwrap();
+        assert!(state.lock().current.is_none());
+        assert_eq!(
+            state.lock().requests.len(),
+            3,
+            "successful delete uses one request"
+        );
+        assert!(matches!(
+            store.delete("key", Some(Version::new("rival"))).await,
+            Err(StoreError::NotFound { .. })
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn staged_put_and_compose_conditions_hold_at_completion() {
+        for compose in [false, true] {
+            for mode in [
+                PutMode::Create,
+                PutMode::Update(Version::new("captured")),
+                PutMode::Update(Version::new("rival")),
+            ] {
+                let (store, state, server) = condition_store().await;
+                let opts = PutOptions {
+                    mode: mode.clone(),
+                    ..Default::default()
+                };
+                let result = if compose {
+                    // One source is copied server-side before conditional completion.
+                    store.compose("dest", &["source".into()], opts).await
+                } else {
+                    store
+                        .put("dest", PutBody::Bytes(Bytes::from_static(b"sample")), opts)
+                        .await
+                };
+                let success = matches!(&mode, PutMode::Update(v) if v.as_str() == "rival");
+                if success {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(StoreError::PreconditionFailed { .. })),
+                        "{result:?}"
+                    );
+                }
+                let state = state.lock();
+                assert_eq!(
+                    state.current.as_deref(),
+                    Some(if success { "published" } else { "rival" })
+                );
+                let completes: Vec<_> = state
+                    .requests
+                    .iter()
+                    .filter(|(m, q, _, _)| m == "POST" && q.contains("uploadId"))
+                    .collect();
+                assert_eq!(completes.len(), 1);
+                assert_eq!(
+                    completes[0].3.as_deref(),
+                    matches!(mode, PutMode::Create).then_some("*")
+                );
+                assert_eq!(
+                    state
+                        .requests
+                        .iter()
+                        .filter(|(m, q, _, _)| m == "DELETE" && q.contains("uploadId"))
+                        .count(),
+                    usize::from(!success)
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_length_mismatch_never_reaches_completion() {
+        for declared in [3, 12] {
+            let (store, state, server) = condition_store().await;
+            let result = store
+                .multipart_put(
+                    "key",
+                    S3ByteStream::from_static(b"sample"),
+                    declared,
+                    &PutOptions {
+                        mode: PutMode::Update(Version::new("rival")),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(StoreError::InvalidArgument(_))),
+                "{result:?}"
+            );
+            let state = state.lock();
+            assert_eq!(state.current.as_deref(), Some("rival"));
+            assert!(
+                !state
+                    .requests
+                    .iter()
+                    .any(|(method, query, _, _)| method == "POST" && query.contains("uploadId"))
+            );
+            assert_eq!(state.requests.iter().filter(|(method, query, _, _)| method == "DELETE" && query.contains("uploadId")).count(), 1);
+            server.abort();
+        }
+    }
 
     /// A fake S3 that answers every request with one status and error code.
     /// Bound on an ephemeral port; the accept loop dies with the test runtime.
     async fn fake_s3(status: u16, code: &'static str) -> S3Client {
+        let (endpoint, _) = counting_fake_s3(status, code).await;
+        client_for(&endpoint)
+    }
+
+    async fn counting_fake_s3(status: u16, code: &'static str) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 8192];
                     let _ = sock.read(&mut buf).await;
+                    seen.fetch_add(1, Ordering::SeqCst);
                     let body = format!(
                         "<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>fake</Message></Error>"
                     );
@@ -1031,21 +1418,71 @@ mod tests {
                 });
             }
         });
-        client_for(&format!("http://127.0.0.1:{port}"))
+        (format!("http://127.0.0.1:{port}"), attempts)
     }
 
     /// SDK retries are disabled so each test observes exactly the error the
     /// service produced; walgit's own retry layer is what these tests cover.
     fn client_for(endpoint: &str) -> S3Client {
+        client_for_attempts(endpoint, 1)
+    }
+
+    fn client_for_attempts(endpoint: &str, max_attempts: u32) -> S3Client {
         let conf = aws_sdk_s3::config::Config::builder()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(static_credentials("test", "test", None))
             .endpoint_url(endpoint)
             .force_path_style(true)
-            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(max_attempts),
+            )
             .behavior_version_latest()
             .build();
         S3Client::from_conf(conf)
+    }
+
+    fn store_for_attempts(endpoint: &str, max_retries: u32) -> S3Store {
+        S3Store {
+            client: client_for_attempts(endpoint, 1),
+            read_client: client_for_attempts(endpoint, max_retries.saturating_add(1)),
+            bucket: "b".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: u64::MAX,
+            multipart_part_size: 8 * 1024 * 1024,
+            max_retries,
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_retry_but_mutations_make_one_attempt() {
+        let (endpoint, attempts) = counting_fake_s3(503, "SlowDown").await;
+        let store = store_for_attempts(&endpoint, 2);
+
+        assert!(store.head("k").await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        assert!(
+            store
+                .put(
+                    "k",
+                    PutBody::Bytes(bytes::Bytes::from_static(b"x")),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        attempts.store(0, Ordering::SeqCst);
+        assert!(store.delete("k", None).await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let zero = store_for_attempts(&endpoint, 0);
+        attempts.store(0, Ordering::SeqCst);
+        assert!(zero.head("k").await.unwrap_err().is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     async fn put_error(client: &S3Client) -> SdkError<PutObjectError> {

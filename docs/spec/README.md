@@ -65,7 +65,7 @@ required implementation obligation even while the corresponding Rust audit remai
 | C6b/C6c, B2 | Exact policy/member/dependency selection, shared snapshot budget, native splice and engine gates | PackCoverage: retire/scope/policy/dependency/generation/companion; retry/old/new/concurrent witnesses | `packfile_uri` selector tests; stock-Git SHA-1/SHA-256 filtered clone and checkout; native residual, metadata isolation and gix/protected fallback |
 | C6d/C10a | Exact captured inputs, raw indexed-link validation in isolated inputs, conserving disk-spooled families, additive output commits and per-attempt indexed conservation/current-tip checks at final seal | PackReplacement: raw/conserve/replace/supersedes; seal/refusal/race/retry witnesses. ClosureProvenance: boundary/tip/seal/retry/rival controls | `pack_segments` conservation/resume fixtures and WAL exact-seal tests; SHA-1/SHA-256 unreachable broken-link rejection and bounded metadata validation; real-index seal regression rejects lost unreachable objects and post-plan uncovered tips; candidate publication/raw-boundary gates and adversarial CAS-race twins remain open |
 | C2/C3 | Checkpoint anti-regression and composition against the current CAS basis | WALCheckpoint fixed/bug; ManifestComposition stale-base/no-checkpoint/no-tips and composite-story witnesses | Delayed-checkpoint test and simulation replay oracle; combined publisher/checkpointer/sealer twin remains required |
-| C5/C7/C8 | No-op receipts use seq 0 and publish no entry; empty-ref pack-only requests reject; unknown CAS remains typed unknown | BatchPublication: partial/isolation/retry/phantom/absence/noopphantom; atomic, late, folded and no-op witnesses | `noop_receipts_never_claim_a_siblings_log_entry`; `lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit`; further late/overlaid failure twins remain required |
+| C5/C7/C8 | No-op receipts use seq 0 and publish no entry; empty-ref pack-only requests reject; unknown CAS remains typed unknown | BatchPublication: partial/isolation/retry/phantom/absence/noopphantom; atomic, late, folded and no-op witnesses | `noop_receipts_never_claim_a_siblings_log_entry`; `lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit`; `a_landed_cas_answered_412_keeps_the_commit`; further late/overlaid failure twins remain required |
 | C3/C7, B5 | Per-claim nonce prevents content-token aliasing; lost-response resolution checks exact bytes | LogSlotClaim: burned retry/early sweep/ambiguous delete/deterministic bytes; retry/sweep/late witnesses | `recreated_claims_have_distinct_bytes_and_resolution_checks_identity`; orphan WAL and fault simulation tests; delayed-delete ABA twin remains required |
 | C9 | Disable redirects and transport retries; only pre-delivery failures permit local fallback | FrontReplay: ambiguous replay/connect taxonomy/no precondition/no-op publishing; fallback/recovery/quiet no-op witnesses | `ambiguous_delivery_and_gateway_responses_never_publish_locally`; no-op WAL receipt test |
 | C10b | Exact retired membership and retained bucket bytes | MCTrim: reader mutation and historical-trim witness | Protected retired pack/index download test; explicit pinned historical local-reader twin remains required |
@@ -120,3 +120,29 @@ The [source range](https://github.com/tlaplus/tlaplus/compare/b123b22...867aefb)
 changes and empty-set equality, enumeration and fingerprint corrections; it is not a semantics-neutral
 update. Historical state counts are not reused as new evidence. The runner does not substitute another
 checker, especially one without equivalent result, liveness and input semantics.
+
+### Conditional backend operations
+
+C3/C7/B5 → S3 native conditional delete and multipart completion; GCS rejects invalid,
+zero and negative update generations instead of silently changing the operation.
+`StoreConditions` checks the mutation point with separate capture, probe/staging, rival
+write and commit actions. Its delete-window, staging-window and invalid-token mutations
+must each violate `MutationCondition`; separate witnesses reach rejected rivals and
+successful delete/create/update. Rust twins are
+`conditional_delete_preserves_rivals_and_only_probes_on_failure`,
+`staged_put_and_compose_conditions_hold_at_completion`, and
+`update_conditions_cannot_turn_into_create_or_overwrite`.
+The model uses distinct versions; content-token ABA remains in `LogSlotClaim`.
+It does not certify a compatible service's implementation of conditional headers.
+
+C3/C5/C7 → Azure attempt-unique block names, complete-input checks and conditional
+block-list commit. `StagedPublication` explores two concurrent two-part creates;
+shared-name and early-commit mutations violate `WholeAttempt`, while unconditional
+completion violates `OneCreateWinner`. Witnesses reach overlapping staging, a
+loser's rejected commit and either writer winning. Rust twins:
+`competing_staged_creates_cannot_mix_each_others_blocks`,
+`malformed_lengths_and_source_errors_never_commit`, and
+`copy_failure_does_not_commit_a_partial_destination`; S3's completion-condition
+regression and `multipart_length_mismatch_never_reaches_completion` also apply.
+This is a safety abstraction, not a claim about byte
+budgets, cancellation cleanup or eventual staging garbage collection.

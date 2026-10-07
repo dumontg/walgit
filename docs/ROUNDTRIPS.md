@@ -47,21 +47,32 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Conserving lifecycle | acquire lease → captured refs/full sync → each output publishes additively → final seal (lease heartbeat → refs revalidation → immutable log PUT → manifest CAS) | one additive publication per new physical checksum and one final CAS; heartbeat GET/CAS calls and full-sync downloads are additional maintenance costs; no change to ordinary push/read budgets | `pack_lifecycle.rs`, `classification.rs::seal_pack_replacement` |
 | Coverage repair | captured snapshot Create → bounded batches of classification CAS → final certificate CAS | snapshot equality GET only on Create conflict; up to 128 classifications per batch; every certificate rechecks current policy and live membership | `pack_lifecycle.rs::repair_metadata` |
 | Native URI selection | existing fetch sync → exact coverage snapshot GET | normally +1 GET, shared maximum 3 attempts across all groups; current manifest/ref view capture adds no GET; optional index trailers are local bounded reads | `packfile_uri.rs::select`, `snapshots.rs::fetch_view` |
+| Protocol v2 object-info | 1 conditional manifest GET; warm size cache adds 0 reads; a remote miss performs the object's pack range reads, with requested objects in parallel | no LIST or pack materialization; placement and requests above 10,000 OIDs are refused before sync; local objects use header lookup and remote delta sizes may require delta/base headers | `smart.rs`, `cache.rs`, `remote.rs::header` |
 | Static pack/index GET | manifest revalidation → object HEAD → body/range GET | 3 warm requests; conditional 304/HEAD omits the body GET; cold registry open may add its normal snapshot/tail reads; no pack materialization or LIST | `packfile_uri.rs::get`, `static_object.rs` |
 | Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
 | Validated remote index admission | warm valid index: 0 store requests; absent/corrupt index: index GET (HEAD first only for old descriptors with unknown size), at most four indexes downloading concurrently | unchanged healthy store depth; corruption now triggers repair instead of admitting bad evidence. Checksums, lock, mmap and cleanup are local work; no LIST. Per-index checksum CPU cost occurs when constructing a new remote inventory, not per object lookup. | `index_cache.rs`, `remote.rs` |
 | Final replacement evidence | coherent refs-level manifest capture → verified current index mappings → conservation/current-tip scan → existing log claim/CAS | warm indexes add 0 store requests; cold/bad evidence adds index GETs (HEAD only for unknown sizes), four concurrent downloads. O(refs) local capture and streaming index-union scan per CAS attempt; no pack download or LIST. This cost is not zero-read or constant-time seal certification. | `classification.rs`, `closure.rs`, `index_cache.rs` |
 | Lost CAS response resolution | fresh manifest GET; only if the exact segment descriptor is listed, GET and compare the claimed log bytes | normally +1 GET on this failure path compared with key/sequence-only resolution; no added successful-push requests. Missing/folded evidence remains unknown. Per-attempt nonce and actual frame sizes are computed locally. | `publish.rs::cas_landed` |
+| Manifest CAS answered 412 | the same evidence check before dropping the own segment: a 412 is contention, or a client library retrying a write that already landed (S3 SDK standard mode, GCS uploads with a precondition) | +1 manifest GET on the 412 path only (+1 log GET when our descriptor is listed); successful publishes unchanged | `publish.rs::process_batch`, `publish_compact_classified`, `publish_settings_impl` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Repository create (`PUT /{o}/{r}`, `walgit repo create`, auto-create on push) | 1 manifest Create PUT; its 412 *is* "exists" (409), whether this instance holds a handle or not; auto-create's lost race adds the open it would have done anyway | 1 (was 0 for a warm handle, which answered 201 for an existing repository) | `registry.rs::create`, `open_or_create` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
+| Azure store read / PUT at or below `multipart_threshold` (any body kind) / HEAD / successful DELETE | 1 | 1; GET streams without SDK partitioning or an extra HEAD; a small file or stream is read into memory rather than staged | `walgit-store/src/azure.rs` |
+| Azure staged PUT | concurrent block stages → conditional block-list commit | ceil(bytes / part_size) + 1; stream length checked before commit | `azure.rs::put_staged` |
+| Azure compose | per source: HEAD → parallel source-version-pinned copy ranges; then one destination commit | sources + copy blocks + 1; empty compose: 1 PUT | `azure.rs::compose` |
+| Azure conditional DELETE returning 412 (failure only) | DELETE → HEAD distinguishes absent from stale version | 2; successful DELETE stays 1 | `azure.rs::delete` |
+| Azure listing | one paged LIST per page, delimiter handled server-side for prefixes | pages only; never enumerate descendants to derive directories | `azure.rs::list`, `list_prefixes` |
+| Azure signed URL (`serve_via = "signed_url"`, and `accel_target` for an nginx edge) | HMAC over a cached user delegation key; one `Get User Delegation Key` POST when no cached key reaches the URL's expiry (24 h lifetime) | 0 per URL; 1 per key | `azure.rs::signed_get_url`, `delegation_key` |
 | Bundle removal (2026-09-11) | v2 capabilities and narrated fetch: removed optional list GET (1 → 0 extra); maintenance no longer reads/CASes a bundle list; direct import no longer composes a wrapper or reads/CASes a bundle list | no new store requests; checkpoint and push budgets unchanged | `smart.rs`, `maintain.rs`, `import_direct.rs` |
 | Canonical checkpoint publication | unchanged: freshness → content-addressed refs PUT ∥ attempt-specific metadata PUT → manifest CAS | 4 healthy requests; equality verification GET only after immutable Create conflict | `checkpoint.rs`, `snapshots.rs` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
+| Configured store retries (failure path only) | healthy calls remain one attempt; transient idempotent GCS/S3 reads and interrupted bulk reads retry with jitter; writes and deletes are always single-attempt | up to `store.max_retries` extra read attempts; no new healthy-path requests or CAS objects | `gcs.rs`, `s3.rs` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
-counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
+counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, checkpoint **4**, and create of an
+existing repository **1** (warm and cold). Cold open used to spend an
 extra unconditional manifest GET (3 requests, 3 sequential rounds); it now applies the manifest it already
 fetched directly (2 requests, 2 rounds). `claim_log_slot`, `cas_landed`, and `put_immutable_create` add probes
 only after Create/CAS failure, so the measured happy-path counts remain unchanged.
@@ -109,3 +120,29 @@ link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a
 - What moved to the failure path, and how often that path runs (measured or reasoned).
 - Which CAS'd object's write rate changes.
 - Sim scenario(s) covering the new failure mode; `Stats::ops` budget assertion if the hot path changed.
+
+### Conditional storage operations (2026-09-13)
+
+S3 conditional DELETE is one conditional DELETE (formerly HEAD → unconditional DELETE,
+2 requests/depth). A 412 may add one failure-only HEAD to distinguish an absent key on compatible services; successful deletes never probe.
+S3 compose removes its destination existence HEAD; source HEADs/staging are unchanged and
+create/update preconditions apply at the final multipart commit. Large conditional PUTs
+now use bounded multipart staging plus conditional completion instead of a single PUT.
+There is no unconditional retry when a provider refuses the conditional operation.
+GCS invalid update tokens fail locally with zero requests, rather than dropping the
+condition. These preserve C3/C7/B5 at the actual storage commit point.
+
+AWS documents the native conditions for [DELETE](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html)
+and [multipart completion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html).
+The SDK-transport tests assert headers, stale-token rejection, surviving rival data and
+multipart aborts. Model/negative controls and witnesses: `StoreConditions`.
+
+LFS batch presence checks run in ordered groups of at most 16 concurrent HEADs:
+critical-path depth changes from N to ceil(N/16), with N requests unchanged.
+`local_presence_checks_are_parallel_and_preserve_batch_order` covers response
+ordering and presence results across 100 objects with artificial store latency.
+
+Azure small streams and files enforce the declared length while reading, before
+single-PUT publication. An overlong stream stops at its first offending chunk;
+its size hint is never treated as an allocation bound. HTTP credentialed emulator
+endpoints are loopback-only. These local validation checks add no store requests.

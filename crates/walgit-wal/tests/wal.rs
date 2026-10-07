@@ -317,6 +317,74 @@ async fn test_two_registries_cross_sync() {
     );
 }
 
+/// A second create is `AlreadyExists` whether this registry holds the handle
+/// (warm) or never saw the repository (cold): the Create PUT decides, not the map.
+#[tokio::test]
+async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let warm = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let cold = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+    let id = repo_id("test", "twice");
+
+    warm.create(&id, ObjectFormat::Sha1).await.unwrap();
+    for registry in [&warm, &cold] {
+        assert!(matches!(
+            registry.create(&id, ObjectFormat::Sha1).await,
+            Err(walgit_wal::WalError::AlreadyExists)
+        ));
+    }
+    // The losing creates changed nothing: both still open the one repository.
+    assert_eq!(warm.open(&id).await.unwrap().manifest().revision, 1);
+    assert_eq!(cold.open(&id).await.unwrap().manifest().revision, 1);
+}
+
+/// Concurrent creates of one name — on one registry and across two — have
+/// exactly one winner; `open_or_create` (auto-create on push) treats losing
+/// that race as success and opens the winner's repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creates_have_one_winner_and_open_or_create_joins_it() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let a = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let b = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+
+    for (n, (x, y)) in [(&a, &a), (&a, &b)].into_iter().enumerate() {
+        let id = repo_id("race", &format!("create{n}"));
+        let (rx, ry) = tokio::join!(
+            x.create(&id, ObjectFormat::Sha1),
+            y.create(&id, ObjectFormat::Sha1)
+        );
+        let won = [rx.is_ok(), ry.is_ok()];
+        assert_eq!(won.iter().filter(|w| **w).count(), 1, "{n}: one winner");
+        for r in [rx, ry] {
+            if let Err(e) = r {
+                assert!(matches!(e, walgit_wal::WalError::AlreadyExists), "{n}: {e}");
+            }
+        }
+
+        let id = repo_id("race", &format!("auto{n}"));
+        let (hx, hy) = tokio::join!(
+            x.open_or_create(&id, ObjectFormat::Sha1),
+            y.open_or_create(&id, ObjectFormat::Sha1)
+        );
+        assert_eq!(hx.unwrap().manifest().revision, 1, "{n}");
+        assert_eq!(hy.unwrap().manifest().revision, 1, "{n}");
+    }
+}
+
 #[tokio::test]
 async fn test_concurrent_different_refs() {
     let cache = tempfile::tempdir().unwrap();
@@ -2909,6 +2977,122 @@ async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
         );
     }
     assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
+}
+
+/// A client library that retries a conditional write whose first reply was lost gets 412 from its
+/// own landed write. No publisher may read that as a lost race and delete the segment the committed
+/// manifest now lists: not a push, a compaction or a settings change.
+#[tokio::test]
+async fn a_landed_cas_answered_412_keeps_the_commit() {
+    use prost::Message;
+    use walgit_store::ObjectStoreExt;
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let landed_412 = || FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    };
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth.clone(), "landed-412", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("o", "landed");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    // Every segment the manifest lists exists, and a fresh instance syncs to `tip`.
+    let intact = |what: &'static str, tip: String| {
+        let truth = truth.clone();
+        let id = id.clone();
+        async move {
+            let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+            let (_, bytes) = truth.get_bytes(&mkey).await.unwrap().unwrap();
+            let manifest = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
+            for segment in &manifest.log_segments {
+                let key = format!("{}{}", id.store_prefix(), segment.key);
+                assert!(
+                    truth.get_bytes(&key).await.unwrap().is_some(),
+                    "{what}: manifest lists {} but it is gone",
+                    segment.key
+                );
+            }
+            let reader_cache = tempfile::tempdir().unwrap();
+            let reader = Registry::new(truth, Arc::new(make_config(reader_cache.path(), 0)))
+                .open(&id)
+                .await
+                .unwrap();
+            drop(reader.sync_refs().await.unwrap());
+            assert_eq!(
+                reader.local().ref_view().unwrap().get("refs/heads/main"),
+                Some(tip),
+                "{what}"
+            );
+        }
+    };
+
+    let work = WorkRepo::new();
+    let first = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    link.set(landed_412());
+    let pushed = handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &first)]),
+            HashMap::new(),
+        )
+        .await;
+    link.heal();
+    intact("push", first.clone()).await;
+    assert!(
+        pushed
+            .unwrap()
+            .per_ref
+            .iter()
+            .all(|(_, status)| status.is_ok()),
+        "a durable push must be acknowledged"
+    );
+
+    let second = work.commit("second", "more");
+    let pack = ingest_pack_data(&handle, work.create_incremental_pack(&second, &first))
+        .await
+        .unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", &first, &second)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let repack = handle
+        .local()
+        .repack(walgit_git::RepackOptions {
+            mode: walgit_git::RepackMode::Full,
+            write_bitmap: false,
+            write_midx: false,
+            keep: vec![],
+        })
+        .await
+        .unwrap();
+    link.set(landed_412());
+    let compacted = handle
+        .publish_compact(repack.new_packs[0].clone(), repack.removed.clone(), 2)
+        .await;
+    link.heal();
+    intact("compaction", second.clone()).await;
+    assert!(
+        compacted.is_ok(),
+        "a durable compaction must be acknowledged"
+    );
+
+    link.set(landed_412());
+    let settings = handle
+        .publish_settings("[packs]\nenabled = false\n", "test", "landed 412")
+        .await;
+    link.heal();
+    intact("settings", second).await;
+    assert!(
+        settings.is_ok(),
+        "a durable settings change must be acknowledged"
+    );
 }
 
 #[tokio::test]

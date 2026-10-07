@@ -81,8 +81,8 @@ Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 | **settings** | Per-repository config (maintenance, compaction, upstream follow) published into the WAL with history. |
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, geometric compaction, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Manual `compact --base` rebuilds the base on a host with sufficient disk. |
-| **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
-| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …), GCS and Azure Blob Storage, first class; an in-memory store for tests. |
+| **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git), `proxy` (behind an identity-aware proxy that asserts who and what). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
+| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; Azure Blob Storage (Entra identity or SAS, user-delegation SAS signed URLs) with the opt-in `walgit-store/azure` build feature; an in-memory store for tests. |
 
 ## How it works, briefly
 
@@ -117,6 +117,8 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 
 ## Running it
 
+See [developer setup](docs/DEV_SETUP.md) for tool versions, local store ports and validation commands.
+
 ```sh
 # build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli
@@ -146,6 +148,7 @@ each repository one maintainer (placement globs) and you are done.
 | `none` | everyone is `anon` with write and admin — loopback experiments | nothing |
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
+| `proxy` | whoever an identity-aware proxy in front lets through: it asserts `X-Walgit-Principal`, `X-Walgit-Access` (`read`/`write`/`admin`) and optionally `X-Walgit-Owners`, and proves itself with `X-Walgit-Proxy-Secret` (`proxy_secret_env`, required — loopback too) | whatever the proxy accepts (its own tokens, mTLS, a session) — walgit never sees the credential |
 
 Developer setup is one idempotent command — `sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"` —
 which stores the token in a file only the user can read, installs a tiny git credential helper (git ≥ 2.46: it
@@ -162,6 +165,7 @@ just clippy        # the [workspace.lints] set across all targets, warnings are 
 just ci            # warnings, clippy, test, e2e: everything that must be green before a merge
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
+just test-azure    # isolated Azurite contract + Git push/clone/pull/cold restart (Docker or Podman + uv)
 ```
 
 Code map:
@@ -169,10 +173,10 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, azure (opt-in), memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
-  walgit-server   axum: smart HTTP, LFS, auth (none/token/oidc), the maintainer loop, upstream follow,
+  walgit-server   axum: smart HTTP, LFS, auth (none/token/oidc/proxy), the maintainer loop, upstream follow,
                   web/ (API, UI, SDK routes, SSE), setup.rs (installer + recipes), events bridge
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
   walgit-cli      `walgit serve|import|compact|wal|mirror|synth|config|repo`; `walgit-server` = `walgit serve`

@@ -21,6 +21,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 
 | Doc | Who / when to read it |
 |---|---|
+| `docs/DEV_SETUP.md` | Local tools, build/test entry points, supported platform limits and local store ports. |
 | `GOAL.md` | Everyone, first. What walgit is for, the acceptance table, what we do not optimise for. |
 | `AGENTS.md` (this) | Everyone. Constraints §1, WAL §2, principles §3, decisions §4, working rules §5. |
 | `README.md` | The introduction: why (the Cursor lineage), what it does, how it works briefly, running it, invariants. |
@@ -75,7 +76,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback or `unauthenticated_public_bind` is set for a front that authenticates and sends `X-Walgit-Principal`, D53),
+- Four auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -83,7 +84,16 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   token** (`wgt_…`, HMAC-signed with `session_secret`, minted at `/_auth/tokens` by a signed-in browser, stateless,
   `access_token_ttl`; rotating the secret revokes all), and the HMAC **session cookie** set by `/_auth/login` →
   issuer → `/_auth/callback`. Static `tokens` work in `oidc` mode too (robots). Every path ends in the same
-  allowlist and `write_domains`.
+  allowlist and `write_domains`. **`proxy`** (D55): an identity-aware proxy in front authenticates and authorizes;
+  every request must carry `X-Walgit-Principal` (else 401) and `X-Walgit-Access: read|write|admin` (missing or
+  unknown → 403; admin ⊃ write ⊃ read; nothing in the config grants admin). The proxy proves itself on every
+  request with `X-Walgit-Proxy-Secret` = `$<proxy_secret_env>` (required, loopback listen included — a pod's
+  containers share loopback; trimmed like the header, ≥ 32 bytes, constant-time). Wrong/missing secret or a
+  repeated identity header → **403 naming the proxy, never 401** (the client's credential did not fail; a 401
+  makes git erase it); an unresolvable secret fails startup. `anonymous_read` must be
+  false; `tokens`, `trusted_forwarders`, `admin_*` are refused. Optional `X-Walgit-Owners: <o>[,<o>…] | *` narrows
+  what exists: owner listings omit the rest, every route under their prefix answers the 404 of a missing
+  repository (never 403), their `…/repos` list is `[]`. None of these three headers is read in any other mode.
 - Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/_auth/*` (the
   sign-in flow itself) and **`/services/public/*`** (data-free; today `install.sh` + `ca.pem`; everything else
   under it 404; never reads repo data or takes a bearer — test `public_lane_serves_only_the_installer_without_auth`).
@@ -271,7 +281,7 @@ Unrelated constraints remain in force. The current design target and migration g
   is a frozen snapshot (`frozen_pack_source`). Reproducer: `walgit-git/tests/upload_gix_scale.rs`.
 - **D3** `ObjectStore` trait with CAS version tokens, conditional GET, range, compose; gcs/s3/memory backends.
   `compose` is native on GCS and a multipart `UploadPartCopy` on S3 (`compose_is_native` tells callers which);
-  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3) to fetch an object itself.
+  `accel_target` gives an edge a URL (+ bearer on GCS, presigned on S3, a read SAS on Azure) to fetch an object itself.
 - **D4** protobuf on the wire and in the bucket; schema versioned, append-only.
 - **D5** Repo identity `<owner>/<repo>[.git]`, prefix `repos/<o>/<r>/`, creation = CAS create of the manifest.
 - **D6** Manifest CAS is the only commit point. **D7** No node identity, no elections; leases for exclusivity.
@@ -282,7 +292,7 @@ Unrelated constraints remain in force. The current design target and migration g
 - **D11** Too-large repos are served, not refused: remote reader for the web API; clones via bundle-uri; refs from
   the WAL. Object work returns 503 when remote objects are disabled or the repository is excluded from this host's
   serving placement (D30).
-- **D12** Auth is `none` | `token` | `oidc` (§1.3). `oidc` is generic OpenID Connect through discovery; the
+- **D12** Auth is `none` | `token` | `oidc` (§1.3; `proxy` added by D55). `oidc` is generic OpenID Connect through discovery; the
   walgit-issued access token (`wgt_…`, HMAC, stateless, `/_auth/tokens`) is the credential git uses, so no client
   needs a vendor CLI to mint tokens. An edge that wants to do auth itself uses `auth_request /_auth/check`
   (`deploy/nginx.conf.example`).
@@ -487,13 +497,13 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
-- **D50 (2026-10-06): Azure Blob Storage is a store backend.** `azure` (`walgit-store/src/azure.rs`) speaks
-  the Blob REST API, authenticated with the account's shared key or with AKS Workload Identity (the pod's
-  federated token exchanged for a Microsoft Entra token, cached until 5 minutes before expiry). CAS is
-  `If-Match`/`If-None-Match`, conditional delete is native, and large objects go up as blocks committed by one
-  conditional `Put Block List` (a large `Create` is atomic, unlike S3). No compose: `publish` uploads whole.
-  Every request has connect and read timeouts; a full store stall still lasts minutes for a client, because
-  the retries above the store multiply them. Contract suite against Azurite.
+- **D50 (2026-10-01): `WALGIT__` overrides fail closed.** An environment override this build cannot
+  apply (malformed name, unknown section or key, wrong type) is a startup and `config check` error that
+  names each variable and the nearest known key; nothing of the batch is applied. This supersedes the
+  warn-and-ignore loader (2026-08-21: a key newer than one host's image crash-looped it): a host running
+  on a default it was told to change is the worse failure, and the file already refuses unknown keys.
+  Roll the image before the env that needs it; gate the rollout on `walgit config check --env-file`
+  run by the binary that will serve.
 
 - **D51 (2026-10-06): Pushed packs are held to object and inflation limits before `index-pack` reads
   them.** `git index-pack` inflates whatever entry headers declare and holds objects while it resolves deltas,
@@ -508,11 +518,26 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   past `body_idle_timeout`, or under `min_body_bytes_per_second` over `body_rate_window`, ends the request, so
   trickled bodies cannot hold request slots. The clock starts at the handler's first read.
 
-- **D53 (2026-10-06): `none` mode may bind a non-loopback address behind an authenticating front.**
-  `server.auth.unauthenticated_public_bind` is for a deployment whose front authenticates every request and
-  names the user in `X-Walgit-Principal` (already honoured in `none` mode); that name is the push author in
-  the log and the principal policy rules see. The front must overwrite the header on every request: walgit
-  trusts whatever arrives. No other auth path changes.
+- **D54 (2026-10-07): Azure conditional writes are sent once, and listings skip directories.** A conditional
+  write (`If-Match`/`If-None-Match` upload, block list commit or delete) goes through a client without SDK retries:
+  a resent write whose first reply was lost meets its own committed write and answers 412, which callers read as a
+  lost race. Reads, listings and block staging keep the SDK retries. An account with a hierarchical namespace lists
+  every directory of a key as a zero-length blob marked `hdi_isfolder`; listings request metadata and skip them.
+
+- **D55 (2026-09-30): `proxy` mode — an identity-aware proxy is the authority, and must prove it.** Deployments
+  that already verify identity and decide access at a gateway (JWT verification, an external authorizer) need
+  walgit to take that verdict, not re-derive it. `none` + `X-Walgit-Principal` is not that: everyone is admin,
+  any loopback caller may name anyone, every name inherits write. `proxy` is explicit instead: principal and
+  access level are both required headers (no default, no anonymous, no config-granted admin); a shared secret
+  is the trust boundary on every listen address (a sidecar's loopback is shared by the whole pod, so reaching
+  it proves nothing), checked before any other header is read, and failing it is a 403 that names the proxy
+  (a proxy fault must not cost the user their stored credential); the proxy must strip the `X-Walgit-*`
+  identity headers clients send. The owner scope is a listing filter and a second wall — the proxy
+  still decides per repository — and answers like absence (404, `[]`) so it confirms nothing beyond itself.
+  Scope checks run once over all matched `{owner}/{repo}` routes (`web::owner_scope` as a `route_layer`) and
+  in `dispatch_route` for the fallback (git, LFS), so a new repository route inherits them. The principal name
+  is what `policy.json`, logs and push attribution see, as in every mode. A push broker behind proxy-mode
+  fronts keeps `token` mode (`trusted_forwarders`): the hop is walgit-to-walgit, not through the proxy.
 
 ## 5. Working rules
 
@@ -533,9 +558,8 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 - **Standalone first (D39):** a feature must work with walgit hit directly (no edge, in-process TLS, bytes
   streamed by walgit). Anything an edge takes over is announced per request in `X-Walgit-Capabilities`; never
   infer an edge from config, never hardcode a hostname in `crates/` or `web/`.
-- **S3, GCS and Azure are first class.** Every store feature has an implementation in each and runs in the contract
-  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`, `just test-azure` against Azurite); "GCS only" is
-  a bug. Compose is the exception: optional by design, absent on Azure (D50).
+- **S3 and GCS are both first class.** Every store feature has both implementations and runs in the contract
+  suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Exercise
   ordinary clone/fetch and bounded maintenance against the rig before testing on large repositories.
 - No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full

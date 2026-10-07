@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use walgit_proto::keys;
 
@@ -15,6 +16,9 @@ use crate::repo::RepoRoute;
 use crate::smart::open_repo;
 use crate::stream::body_to_async_read;
 use walgit_store::{ObjectStore, ObjectStoreExt, PutBody, PutMode};
+
+// Collapse git-lfs's default 100-object batch without unbounded store fan-out.
+const LOCAL_PRESENCE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Deserialize)]
 pub struct BatchRequest {
@@ -72,8 +76,67 @@ struct LfsError {
     message: String,
 }
 
+/// Operation labels for the LFS metrics below.
+const OP_BATCH: &str = "batch";
+const OP_GET: &str = "get";
+const OP_PUT: &str = "put";
+const OP_VERIFY: &str = "verify";
+
+/// Handler completion, not socket transfer completion. Downloads stream after
+/// this returns; successful responses may still fail or be cancelled downstream.
+fn record_lfs(op: &'static str, t0: std::time::Instant, result: &Result<Response, ApiError>) {
+    metrics::histogram!("walgit_lfs_handler_seconds", "op" => op)
+        .record(t0.elapsed().as_secs_f64());
+    let outcome = match result {
+        Ok(response) if response.status() == StatusCode::NOT_FOUND => "not_found",
+        Ok(response)
+            if response.status().is_client_error() || response.status().is_server_error() =>
+        {
+            "error"
+        }
+        Ok(_) => "ok",
+        Err(ApiError::NotFound(_)) => "not_found",
+        Err(_) => "error",
+    };
+    metrics::counter!("walgit_lfs_requests_total", "op" => op, "result" => outcome).increment(1);
+}
+
+/// Offered body bytes: includes an interrupted GET's offered range, excludes
+/// HEAD, errors, 304 and edge offload. This is not delivered network throughput.
+fn record_download_offer(method: &axum::http::Method, response: &Response) {
+    if method != axum::http::Method::GET
+        || !matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT
+        )
+        || response.headers().contains_key("x-accel-redirect")
+    {
+        return;
+    }
+    if let Some(bytes) = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        metrics::counter!("walgit_lfs_response_bytes_offered_total").increment(bytes);
+    }
+}
+
 /// `POST /{repo}/info/lfs/objects/batch`
 pub async fn batch(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = batch_inner(st, route, headers, body_bytes).await;
+    record_lfs(OP_BATCH, t0, &r);
+    r
+}
+
+async fn batch_inner(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
@@ -84,7 +147,16 @@ pub async fn batch(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    match body.operation.as_str() {
+        "upload" => {
+            st.auth.require_write(headers).await.map_err(auth_err)?;
+        }
+        "download" => {
+            st.auth.require_read(headers).await.map_err(auth_err)?;
+        }
+        _ => return Err(ApiError::BadRequest("unsupported LFS operation".into())),
+    }
+
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
@@ -96,15 +168,25 @@ pub async fn batch(
         require_lfs_oid(&o.oid)?;
     }
     // Local presence first; then one bounded upstream batch for the misses.
-    let mut local = Vec::with_capacity(body.objects.len());
-    let mut missing = Vec::new();
-    for o in &body.objects {
-        let exists = store.exists(&keys::lfs_key(&o.oid)).await.unwrap_or(false);
-        local.push(exists);
-        if !exists {
-            missing.push((o.oid.clone(), o.size));
-        }
-    }
+    let local_keys = body
+        .objects
+        .iter()
+        .map(|o| keys::lfs_key(&o.oid))
+        .collect::<Vec<_>>();
+    let local = futures::stream::iter(local_keys.into_iter().map(|key| {
+        let store = store.clone();
+        async move { store.exists(&key).await.unwrap_or(false) }
+    }))
+    .buffered(LOCAL_PRESENCE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let missing = body
+        .objects
+        .iter()
+        .zip(&local)
+        .filter(|(_, exists)| !**exists)
+        .map(|(o, _)| (o.oid.clone(), o.size))
+        .collect::<Vec<_>>();
     let upstream_has = match (&cfg.upstream.lfs, missing.is_empty()) {
         (Some(upstream), false) => {
             st.lfs_upstream
@@ -214,6 +296,23 @@ pub async fn batch(
 /// immutable-object contract (strong `ETag`, 304, Range/If-Range, HEAD,
 /// Content-Length); see `static_object`. LFS objects are sha256-addressed.
 pub async fn get_object(
+    st: &AppState,
+    route: &RepoRoute,
+    method: &axum::http::Method,
+    headers: &HeaderMap,
+    query: &str,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = get_object_inner(st, route, method, headers, query, peer).await;
+    if let Ok(response) = &r {
+        record_download_offer(method, response);
+    }
+    record_lfs(OP_GET, t0, &r);
+    r
+}
+
+async fn get_object_inner(
     st: &AppState,
     route: &RepoRoute,
     method: &axum::http::Method,
@@ -389,6 +488,18 @@ pub async fn put_object(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = put_object_inner(st, route, headers, body).await;
+    record_lfs(OP_PUT, t0, &r);
+    r
+}
+
+async fn put_object_inner(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use sha2::{Digest, Sha256};
@@ -438,6 +549,9 @@ pub async fn put_object(
     if hex::encode(hasher.finalize()) != oid {
         return Err(ApiError::BadRequest("lfs object sha256 mismatch".into()));
     }
+    // Input has been fully consumed and its hash validated; the store PUT may fail.
+    metrics::counter!("walgit_lfs_upload_bytes_validated_total").increment(n);
+    metrics::histogram!("walgit_lfs_upload_object_bytes").record(n as f64);
     store
         .put(
             &key,
@@ -451,6 +565,18 @@ pub async fn put_object(
 
 /// `POST /{repo}/info/lfs/verify`
 pub async fn verify(
+    st: &AppState,
+    route: &RepoRoute,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let t0 = std::time::Instant::now();
+    let r = verify_inner(st, route, headers, body_bytes).await;
+    record_lfs(OP_VERIFY, t0, &r);
+    r
+}
+
+async fn verify_inner(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
@@ -517,6 +643,7 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }
@@ -524,4 +651,60 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
 }
 fn store_err(e: walgit_store::StoreError) -> ApiError {
     e.into()
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+
+    #[test]
+    fn offers_exclude_head_errors_not_modified_and_edge_offload() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for (method, status, accel) in [
+                ("HEAD", 200, false),
+                ("GET", 304, false),
+                ("GET", 404, false),
+                ("GET", 416, false),
+                ("GET", 200, true),
+            ] {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header("content-length", "100");
+                if accel {
+                    builder = builder.header("x-accel-redirect", "/internal");
+                }
+                let response = builder.body(Body::empty()).unwrap();
+                record_download_offer(&method.parse().unwrap(), &response);
+            }
+            assert!(
+                !handle
+                    .render()
+                    .contains("walgit_lfs_response_bytes_offered_total")
+            );
+            for (status, bytes) in [(200, 100), (206, 7)] {
+                let response = Response::builder()
+                    .status(status)
+                    .header("content-length", bytes)
+                    .body(Body::empty())
+                    .unwrap();
+                record_download_offer(&axum::http::Method::GET, &response);
+                // Dropping a response does not turn offered bytes into delivered bytes.
+                drop(response);
+            }
+            let response = Response::builder().status(503).body(Body::empty()).unwrap();
+            record_lfs(OP_GET, std::time::Instant::now(), &Ok(response));
+        });
+        let text = handle.render();
+        assert!(
+            text.contains("walgit_lfs_response_bytes_offered_total 107"),
+            "{text}"
+        );
+        assert!(
+            text.contains("walgit_lfs_requests_total{op=\"get\",result=\"error\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("walgit_lfs_bytes_total"));
+    }
 }

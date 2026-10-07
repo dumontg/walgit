@@ -1,806 +1,589 @@
-//! Azure Blob Storage backend (Azurite for local dev / CI).
+//! Azure Blob Storage with conditional publication and bounded streaming.
 //!
-//! Talks to the Blob REST API with `reqwest`. `bucket` is the container. Two credentials:
-//! the account's shared key (`auth = "shared_key"`, connection string from
-//! `store.azure.connection_string_env`) signs each request; Workload Identity
-//! (`auth = "workload_identity"`) exchanges the pod's federated token for a Microsoft
-//! Entra access token, sent as `Authorization: Bearer`.
-//!
-//! ## Version tokens
-//!
-//! Blob `ETag`s, quotes stripped, are the opaque `Version`. Conditional headers send
-//! them quoted again.
-//!
-//! ## Conditional writes
-//!
-//! `PutMode::Create`    → `If-None-Match: *`  (409 `BlobAlreadyExists` or 412 when present).
-//! `PutMode::Update(v)` → `If-Match: "<etag>"` (412 `ConditionNotMet` on mismatch).
-//! Objects above `multipart_threshold` go up as blocks (`Put Block`), committed by one
-//! `Put Block List` that carries the same condition: unlike S3, a large conditional
-//! create is atomic. Uncommitted blocks expire on their own.
-//!
-//! ## Conditional delete
-//!
-//! Native: `DELETE` with `If-Match` (412 on mismatch). No HEAD + DELETE race.
-//!
-//! ## Listing
-//!
-//! `List Blobs` pages by an opaque marker and has no `start-after`: keys up to
-//! `start_after` are skipped client side (listings are off the hot path, principle VII).
-//!
-//! ## Timeouts
-//!
-//! Every request has a connect timeout and a read timeout, so a store that stops
-//! answering fails requests (retryable) instead of holding them.
+//! The generated SDK lacks delimiter/BlobPrefix support, and its managed GET
+//! partitions even a single requested range. Those two operations use the same
+//! SDK HTTP pipeline directly; all authentication, retry and transport remain
+//! SDK-owned. PUTs publish once, after uniquely named blocks have been staged.
+//! Signed URLs are user-delegation SAS: HMAC over a cached key the account
+//! issues to this identity, so walgit never holds a shared key.
 
-use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::num::NonZero;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use azure_core::credentials::{TokenCredential, TokenRequestOptions};
+use azure_core::error::ErrorKind;
+use azure_core::http::headers::{AUTHORIZATION, CONTENT_LENGTH, ETAG, HeaderName};
+use azure_core::http::policies::auth::{Authorizer, BearerTokenAuthorizationPolicy, OnRequest};
+use azure_core::http::{
+    ClientMethodOptions, ClientOptions, Context, Etag, Method, Pipeline, Request, RetryOptions,
+    StatusCode,
+};
+use azure_core::time::{Duration, OffsetDateTime};
+use azure_storage_blob::models::{
+    BlobClientDeleteOptions, BlobClientGetPropertiesResultHeaders,
+    BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
+    BlockBlobClientCommitBlockListResultHeaders, BlockBlobClientStageBlockFromUrlOptions,
+    BlockBlobClientUploadOptions, BlockLookupList, HttpRange, ListBlobsIncludeItem,
+};
+use azure_storage_blob::{BlobClient, BlobContainerClient, BlobContainerClientOptions};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use bytes::Bytes;
-use futures::StreamExt;
+use bytes::{Bytes, BytesMut};
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
-use reqwest::{Method, StatusCode};
+use serde::Deserialize;
 use sha2::Sha256;
-
-use walgit_config::{AzureAuth, AzureConfig};
+use url::Url;
+use uuid::Uuid;
+use walgit_config::{AzureCredential, StoreConfig};
 
 use crate::{
-    BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
+    ByteStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
     Result, StoreError, Version, util,
 };
 
-const API_VERSION: &str = "2021-08-06";
-const LIST_PAGE: u32 = 5000;
-const ATTEMPTS: u32 = 4;
-const TOKEN_SCOPE: &str = "https://storage.azure.com/.default";
-/// A cached access token is replaced this long before it expires.
-const TOKEN_REFRESH_MARGIN: Duration = Duration::from_mins(5);
+const MAX_PAGE: i32 = 5000;
+const MAX_BLOCKS: usize = 50_000;
+const MAX_BLOCK_BYTES: u64 = 4000 * 1024 * 1024;
+// A conservative source-copy bound also works with emulators and older accounts.
+const MAX_COPY_BYTES: u64 = 100 * 1024 * 1024;
+const AZURE_API_VERSION: &str = "2026-04-06";
+const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
+const CONTENT_RANGE: HeaderName = HeaderName::from_static("content-range");
+const COPY_SOURCE: HeaderName = HeaderName::from_static("x-ms-copy-source");
+// The SAS layout this module signs. Newer service versions add fields to the
+// string-to-sign; the signed `sv` pins which layout the service verifies.
+const SAS_VERSION: &str = "2020-12-06";
+const SAS_CLOCK_SKEW: Duration = Duration::minutes(5);
+const DELEGATION_KEY_LIFETIME: Duration = Duration::hours(24);
+// The service refuses a user delegation key valid for longer than seven days.
+const DELEGATION_KEY_MAX_LIFETIME: Duration = Duration::days(7);
 
-/// Account name, credential and blob endpoint.
-#[derive(Clone)]
-struct Account {
-    name: String,
-    credential: Credential,
-    /// Base URL of the blob service, without a trailing slash: the account's own host
-    /// on Azure, `http://127.0.0.1:10000/devstoreaccount1` on Azurite.
-    endpoint: String,
-    /// The path the endpoint adds before `/<container>` (Azurite: `/devstoreaccount1`),
-    /// which shared key signing includes in the canonical resource.
-    endpoint_path: String,
-}
-
-#[derive(Clone)]
-enum Credential {
-    /// The decoded account key.
-    SharedKey(Vec<u8>),
-    Entra(Arc<WorkloadIdentity>),
-}
-
-/// Azurite's well known development account; the key is the public one Microsoft
-/// documents for the emulator.
-const DEV_ACCOUNT: &str = "devstoreaccount1";
-const DEV_KEY: &str =
-    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
-
-impl Account {
-    fn parse(connection_string: &str) -> anyhow::Result<Self> {
-        let mut fields = std::collections::HashMap::new();
-        for part in connection_string
-            .split(';')
-            .filter(|p| !p.trim().is_empty())
-        {
-            let (k, v) = part
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("azure: malformed connection string field"))?;
-            fields.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
-        }
-        let dev = fields
-            .get("usedevelopmentstorage")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-        let name = match fields.get("accountname") {
-            Some(n) => n.clone(),
-            None if dev => DEV_ACCOUNT.to_owned(),
-            None => anyhow::bail!("azure: connection string has no AccountName"),
-        };
-        let key_b64 = match fields.get("accountkey") {
-            Some(k) => k.clone(),
-            None if dev => DEV_KEY.to_owned(),
-            None => anyhow::bail!("azure: connection string has no AccountKey"),
-        };
-        let key = BASE64
-            .decode(key_b64.as_bytes())
-            .map_err(|e| anyhow::anyhow!("azure: AccountKey is not base64: {e}"))?;
-        let endpoint = if let Some(e) = fields.get("blobendpoint") {
-            e.trim_end_matches('/').to_owned()
-        } else if dev {
-            format!("http://127.0.0.1:10000/{DEV_ACCOUNT}")
-        } else {
-            let protocol = fields
-                .get("defaultendpointsprotocol")
-                .map_or("https", String::as_str);
-            let suffix = fields
-                .get("endpointsuffix")
-                .map_or("core.windows.net", String::as_str);
-            format!("{protocol}://{name}.blob.{suffix}")
-        };
-        let endpoint_path = endpoint_path(&endpoint)?;
-        Ok(Account {
-            name,
-            credential: Credential::SharedKey(key),
-            endpoint,
-            endpoint_path,
-        })
-    }
-
-    /// The account named in the config, reached with Workload Identity tokens.
-    fn entra(cfg: &AzureConfig, identity: WorkloadIdentity) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !cfg.account.is_empty(),
-            "azure: store.azure.account must be set with auth = workload_identity"
-        );
-        let endpoint = if cfg.endpoint.is_empty() {
-            format!("https://{}.blob.core.windows.net", cfg.account)
-        } else {
-            cfg.endpoint.trim_end_matches('/').to_owned()
-        };
-        let endpoint_path = endpoint_path(&endpoint)?;
-        Ok(Account {
-            name: cfg.account.clone(),
-            credential: Credential::Entra(Arc::new(identity)),
-            endpoint,
-            endpoint_path,
-        })
-    }
-}
-
-fn endpoint_path(endpoint: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(endpoint)
-        .map_err(|e| anyhow::anyhow!("azure: bad blob endpoint {endpoint}: {e}"))?;
-    Ok(url.path().trim_end_matches('/').to_owned())
-}
-
-/// Microsoft Entra access tokens for a federated identity (AKS Workload Identity): the
-/// projected service account token is exchanged for a storage token, cached until
-/// shortly before it expires.
-struct WorkloadIdentity {
-    token_url: String,
-    client_id: String,
-    /// Re-read on every exchange: the kubelet rotates it.
-    token_file: PathBuf,
-    cached: tokio::sync::Mutex<Option<CachedToken>>,
-}
-
-struct CachedToken {
-    value: String,
-    refresh_at: Instant,
-}
-
-#[derive(serde::Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    expires_in: u64,
-}
-
-impl WorkloadIdentity {
-    /// From the variables the AKS Workload Identity webhook injects into the pod.
-    fn from_env() -> anyhow::Result<Self> {
-        let var = |name: &str| {
-            std::env::var(name)
-                .map_err(|_| anyhow::anyhow!("azure workload identity: env var {name} not set"))
-        };
-        let authority = std::env::var("AZURE_AUTHORITY_HOST")
-            .unwrap_or_else(|_| "https://login.microsoftonline.com/".to_owned());
-        Ok(Self::new(
-            &authority,
-            &var("AZURE_TENANT_ID")?,
-            var("AZURE_CLIENT_ID")?,
-            PathBuf::from(var("AZURE_FEDERATED_TOKEN_FILE")?),
-        ))
-    }
-
-    fn new(authority: &str, tenant: &str, client_id: String, token_file: PathBuf) -> Self {
-        WorkloadIdentity {
-            token_url: format!(
-                "{}/{tenant}/oauth2/v2.0/token",
-                authority.trim_end_matches('/')
-            ),
-            client_id,
-            token_file,
-            cached: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    /// A valid access token. One caller at a time refreshes; the others wait for it.
-    async fn token(&self, http: &reqwest::Client) -> Result<String> {
-        let mut cached = self.cached.lock().await;
-        if let Some(t) = cached.as_ref()
-            && Instant::now() < t.refresh_at
-        {
-            return Ok(t.value.clone());
-        }
-        let assertion = tokio::fs::read_to_string(&self.token_file)
-            .await
-            .map_err(|e| {
-                StoreError::other(anyhow::anyhow!(
-                    "azure: read federated token {}: {e}",
-                    self.token_file.display()
-                ))
-            })?;
-        let resp = http
-            .post(&self.token_url)
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", self.client_id.as_str()),
-                ("scope", TOKEN_SCOPE),
-                (
-                    "client_assertion_type",
-                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                ),
-                ("client_assertion", assertion.trim()),
-            ])
-            .send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("azure token http: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let detail: String = body.chars().take(300).collect();
-            let err = anyhow::anyhow!("azure token: status {status} {detail}");
-            return Err(if is_transient_status(status) {
-                StoreError::Retryable(err)
-            } else {
-                StoreError::Other(err)
-            });
-        }
-        let token: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("azure token body: {e}")))?;
-        let lifetime = Duration::from_secs(token.expires_in);
-        *cached = Some(CachedToken {
-            value: token.access_token.clone(),
-            refresh_at: Instant::now() + lifetime.saturating_sub(TOKEN_REFRESH_MARGIN),
-        });
-        Ok(token.access_token)
-    }
-}
-
-/// A request about to be signed and sent.
-struct Request<'a> {
-    method: Method,
-    /// Object key, or `None` for a container level request.
-    key: Option<&'a str>,
-    /// Query parameters, unencoded.
-    query: Vec<(&'static str, String)>,
-    /// Headers that take part in signing by position.
-    if_match: Option<String>,
-    if_none_match: Option<String>,
-    content_type: Option<&'static str>,
-    content_length: u64,
-    /// `x-ms-*` headers besides date and version.
-    ms_headers: Vec<(&'static str, String)>,
-}
-
-impl<'a> Request<'a> {
-    fn new(method: Method, key: Option<&'a str>) -> Self {
-        Request {
-            method,
-            key,
-            query: Vec::new(),
-            if_match: None,
-            if_none_match: None,
-            content_type: None,
-            content_length: 0,
-            ms_headers: Vec::new(),
-        }
-    }
-}
-
-/// Azure Blob Storage object store.
 pub struct AzureStore {
-    http: reqwest::Client,
-    account: Account,
-    container: String,
+    container: Arc<BlobContainerClient>,
+    /// The same container without SDK retries, for conditional writes: a resent
+    /// conditional write whose first reply was lost meets its own committed write
+    /// and answers 412, which callers read as a lost race.
+    mutations: Arc<BlobContainerClient>,
+    pipeline: Pipeline,
+    /// `None` under SAS authentication (a user delegation key needs an Entra
+    /// identity, and the configured SAS may grant more than a read) or when
+    /// no account name is known for the canonical resource.
+    signing: Option<Signing>,
+    delegation_key: parking_lot::Mutex<Option<Arc<CachedDelegationKey>>>,
+    /// The container URL carries the configured SAS instead of a credential.
+    sas_auth: bool,
     multipart_threshold: u64,
-    multipart_part_size: u64,
+    multipart_part_size: usize,
+    max_concurrent_blocks: usize,
+}
+
+struct Signing {
+    account: String,
+    container: String,
+    /// `{endpoint}` without the container segment: where the delegation key is requested.
+    service_url: Url,
+}
+
+/// A user delegation key as the service returned it, every field verbatim so
+/// the string-to-sign carries exactly what the service will recompute.
+#[derive(Deserialize)]
+struct DelegationKey {
+    #[serde(rename = "SignedOid")]
+    oid: String,
+    #[serde(rename = "SignedTid")]
+    tid: String,
+    #[serde(rename = "SignedStart")]
+    start: String,
+    #[serde(rename = "SignedExpiry")]
+    expiry: String,
+    #[serde(rename = "SignedService")]
+    service: String,
+    #[serde(rename = "SignedVersion")]
+    version: String,
+    /// Base64 key material. Never logged, never in an error.
+    #[serde(rename = "Value")]
+    value: String,
+}
+
+struct CachedDelegationKey {
+    key: DelegationKey,
+    expires_at: OffsetDateTime,
 }
 
 impl AzureStore {
-    /// Build a store from `walgit-config::StoreConfig`: the connection string comes from
-    /// the env var named in `cfg.azure.connection_string_env`, Workload Identity from the
-    /// pod's environment.
-    pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let account = match cfg.azure.auth {
-            AzureAuth::SharedKey => {
-                let env = &cfg.azure.connection_string_env;
-                let connection_string = std::env::var(env).map_err(|_| {
-                    anyhow::anyhow!("azure: env var {env} not set (connection string)")
-                })?;
-                Account::parse(&connection_string)?
-            }
-            AzureAuth::WorkloadIdentity => {
-                Account::entra(&cfg.azure, WorkloadIdentity::from_env()?)?
-            }
+    pub fn new(cfg: &StoreConfig) -> anyhow::Result<Self> {
+        let sas = match std::env::var(&cfg.azure.sas_token_env) {
+            Ok(token) if !token.is_empty() => Some(token),
+            Err(std::env::VarError::NotPresent) => None,
+            _ => anyhow::bail!(
+                "azure: {} must be unset or contain a non-empty SAS token",
+                cfg.azure.sas_token_env
+            ),
         };
-        Self::with_account(cfg, account)
+        let url = container_url(cfg, sas.as_deref())?;
+        let credential = if sas.is_some() {
+            None
+        } else {
+            Some(credential(cfg.azure.credential)?)
+        };
+        // Reads follow `store.max_retries`; conditional writes never retry (see `mutations`).
+        let options = ClientOptions {
+            retry: RetryOptions::exponential(azure_core::http::ExponentialRetryOptions {
+                max_retries: cfg.max_retries,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Self::with_client_options(cfg, url, credential, options)
     }
 
-    fn with_account(cfg: &walgit_config::StoreConfig, account: Account) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(AzureStore {
-            http,
-            account,
-            container: cfg.bucket.clone(),
+    fn with_client_options(
+        cfg: &StoreConfig,
+        url: Url,
+        credential: Option<Arc<dyn TokenCredential>>,
+        mut options: ClientOptions,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_BLOCK_BYTES).contains(&cfg.multipart_part_size.as_u64()),
+            "azure: multipart_part_size must be between 1 byte and 4000 MiB"
+        );
+        anyhow::ensure!(
+            cfg.multipart_threshold.as_u64() <= MAX_BLOCK_BYTES,
+            "azure: multipart_threshold must be at most 4000 MiB"
+        );
+        anyhow::ensure!(
+            cfg.azure.max_concurrent_blocks > 0,
+            "azure: max_concurrent_blocks must be positive"
+        );
+        anyhow::ensure!(
+            credential.is_none() || url.scheme() == "https",
+            "azure: identity authentication requires HTTPS"
+        );
+        // Disable transparent decompression: stored bytes and byte ranges are exact.
+        if options.transport.is_none() {
+            options.transport = Some(azure_core::http::Transport::new(
+                azure_core::http::new_http_client(Some(azure_core::http::HttpClientOptions {
+                    automatic_decompression: false,
+                })),
+            ));
+        }
+        let sas_auth = credential.is_none();
+        let signing = if sas_auth {
+            None
+        } else {
+            signing_target(cfg, &url)?
+        };
+        if let Some(credential) = credential {
+            // One authorizer/cache supplies both headers on each retry of a
+            // server-side copy. A private source does not inherit destination auth.
+            options.per_try_policies.push(Arc::new(
+                BearerTokenAuthorizationPolicy::new(credential, [STORAGE_SCOPE])
+                    .with_on_request(Arc::new(BlobAuthorization)),
+            ));
+        }
+        let container = BlobContainerClient::new(
+            url,
+            None,
+            Some(BlobContainerClientOptions {
+                client_options: options.clone(),
+                version: AZURE_API_VERSION.into(),
+            }),
+        )?;
+        let mutations = BlobContainerClient::new(
+            container.url().clone(),
+            None,
+            Some(BlobContainerClientOptions {
+                client_options: ClientOptions {
+                    retry: RetryOptions::none(),
+                    ..options.clone()
+                },
+                version: AZURE_API_VERSION.into(),
+            }),
+        )?;
+        let pipeline = Pipeline::new(
+            option_env!("CARGO_PKG_NAME"),
+            option_env!("CARGO_PKG_VERSION"),
+            options,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        Ok(Self {
+            container: Arc::new(container),
+            mutations: Arc::new(mutations),
+            pipeline,
+            signing,
+            delegation_key: parking_lot::Mutex::new(None),
+            sas_auth,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
-            multipart_part_size: cfg.multipart_part_size.as_u64().max(1024 * 1024),
+            multipart_part_size: usize::try_from(cfg.multipart_part_size.as_u64())?,
+            max_concurrent_blocks: cfg.azure.max_concurrent_blocks,
         })
     }
 
-    fn path(&self, key: Option<&str>) -> String {
-        match key {
-            Some(k) => format!("/{}/{}", self.container, util::encode_path(k)),
-            None => format!("/{}", self.container),
-        }
+    fn blob(&self, key: &str) -> BlobClient {
+        self.container.blob_client(key)
     }
 
-    /// The `Authorization: SharedKey` value for a request (Blob service, version 2015+).
-    fn sign(&self, req: &Request<'_>, date: &str, key: &[u8]) -> Result<String> {
-        let length = if req.content_length == 0 {
-            String::new()
+    /// The client for a write: one without SDK retries when the write is conditional.
+    fn writer(&self, key: &str, conditional: bool) -> BlobClient {
+        if conditional {
+            self.mutations.blob_client(key)
         } else {
-            req.content_length.to_string()
-        };
-        let mut ms: Vec<(String, String)> = req
-            .ms_headers
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), v.clone()))
-            .chain([
-                ("x-ms-date".to_owned(), date.to_owned()),
-                ("x-ms-version".to_owned(), API_VERSION.to_owned()),
-            ])
-            .collect();
-        ms.sort();
-        let mut headers = String::new();
-        for (k, v) in &ms {
-            let _ = writeln!(headers, "{k}:{v}");
+            self.blob(key)
         }
-        let mut resource = format!(
-            "/{}{}{}",
-            self.account.name,
-            self.account.endpoint_path,
-            self.path(req.key)
-        );
-        let mut query: Vec<&(&str, String)> = req.query.iter().collect();
-        query.sort_by_key(|(k, _)| *k);
-        for (k, v) in query {
-            let _ = write!(resource, "\n{k}:{v}");
-        }
-        let string_to_sign = format!(
-            "{}\n\n\n{}\n\n{}\n\n\n{}\n{}\n\n\n{}{}",
-            req.method,
-            length,
-            req.content_type.unwrap_or(""),
-            req.if_match.as_deref().unwrap_or(""),
-            req.if_none_match.as_deref().unwrap_or(""),
-            headers,
-            resource
-        );
-        let mut mac = Hmac::<Sha256>::new_from_slice(key)
-            .map_err(|e| StoreError::other(anyhow::anyhow!("azure hmac key: {e}")))?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = BASE64.encode(mac.finalize().into_bytes());
-        Ok(format!("SharedKey {}:{signature}", self.account.name))
     }
+}
 
-    /// Sign and send one request; `body` is consumed by this attempt.
-    async fn send(
-        &self,
-        req: &Request<'_>,
-        body: Option<reqwest::Body>,
-    ) -> Result<reqwest::Response> {
-        let date = chrono::Utc::now()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
-        let authorization = match &self.account.credential {
-            Credential::SharedKey(key) => self.sign(req, &date, key)?,
-            Credential::Entra(identity) => format!("Bearer {}", identity.token(&self.http).await?),
+fn container_url(cfg: &StoreConfig, sas: Option<&str>) -> anyhow::Result<Url> {
+    let endpoint = if cfg.azure.endpoint.is_empty() {
+        anyhow::ensure!(
+            !cfg.azure.account.is_empty()
+                && cfg
+                    .azure
+                    .account
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "azure: set a valid storage account or endpoint"
+        );
+        format!("https://{}.blob.core.windows.net", cfg.azure.account)
+    } else {
+        cfg.azure.endpoint.clone()
+    };
+    // Never include the raw endpoint/token in errors; they may contain credentials.
+    let mut url =
+        Url::parse(&endpoint).map_err(|_| anyhow::anyhow!("azure: invalid endpoint URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "azure: endpoint must be an HTTP(S) URL without credentials, query or fragment"
+    );
+    let loopback = url.host_str() == Some("localhost")
+        || match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
         };
-        let mut url =
-            reqwest::Url::parse(&format!("{}{}", self.account.endpoint, self.path(req.key)))
-                .map_err(|e| StoreError::other(anyhow::anyhow!("azure url: {e}")))?;
-        if !req.query.is_empty() {
-            let mut pairs = url.query_pairs_mut();
-            for (k, v) in &req.query {
-                pairs.append_pair(k, v);
-            }
-        }
-        let mut builder = self
-            .http
-            .request(req.method.clone(), url)
-            .header("x-ms-date", &date)
-            .header("x-ms-version", API_VERSION)
-            .header("authorization", authorization);
-        for (k, v) in &req.ms_headers {
-            builder = builder.header(*k, v);
-        }
-        if let Some(v) = &req.if_match {
-            builder = builder.header("if-match", v);
-        }
-        if let Some(v) = &req.if_none_match {
-            builder = builder.header("if-none-match", v);
-        }
-        if let Some(ct) = req.content_type {
-            builder = builder.header("content-type", ct);
-        }
-        if let Some(b) = body {
-            builder = builder.body(b);
-        }
-        builder
-            .send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("azure {} http: {e}", req.method)))
+    anyhow::ensure!(
+        url.scheme() == "https" || loopback,
+        "azure: HTTP endpoints are permitted only on loopback for local emulators"
+    );
+    anyhow::ensure!(
+        !cfg.bucket.is_empty()
+            && cfg
+                .bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "azure: store.bucket must name a container"
+    );
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("azure: invalid endpoint path"))?
+        .pop_if_empty()
+        .push(&cfg.bucket);
+    if let Some(sas) = sas {
+        url.set_query(Some(sas.trim_start_matches('?')));
     }
+    Ok(url)
+}
 
-    /// Send a request whose body can be rebuilt, retrying throttling, server faults and
-    /// connection failures with backoff.
-    async fn send_retrying(
-        &self,
-        req: &Request<'_>,
-        body: impl Fn() -> Option<reqwest::Body>,
-    ) -> Result<reqwest::Response> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let result = self.send(req, body()).await;
-            let retry = match &result {
-                Err(e) => e.is_retryable(),
-                Ok(resp) => is_transient_status(resp.status()),
+/// The account and service URL a signed URL is computed against. The canonical
+/// resource names the account, which a custom `endpoint` does not reveal, so
+/// signing is off until `store.azure.account` is set alongside one.
+fn signing_target(cfg: &StoreConfig, container_url: &Url) -> anyhow::Result<Option<Signing>> {
+    if cfg.azure.account.is_empty() {
+        return Ok(None);
+    }
+    let mut service_url = container_url.clone();
+    service_url
+        .path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("azure: invalid endpoint path"))?
+        .pop();
+    Ok(Some(Signing {
+        account: cfg.azure.account.clone(),
+        container: cfg.bucket.clone(),
+        service_url,
+    }))
+}
+
+fn credential(kind: AzureCredential) -> anyhow::Result<Arc<dyn TokenCredential>> {
+    match kind {
+        AzureCredential::WorkloadIdentity => {
+            Ok(azure_identity::WorkloadIdentityCredential::new(None)?)
+        }
+        AzureCredential::Auto if std::env::var_os("AZURE_FEDERATED_TOKEN_FILE").is_some() => {
+            Ok(azure_identity::WorkloadIdentityCredential::new(None)?)
+        }
+        AzureCredential::ManagedIdentity | AzureCredential::Auto => {
+            let id = std::env::var("AZURE_CLIENT_ID")
+                .ok()
+                .map(azure_identity::UserAssignedId::ClientId);
+            Ok(azure_identity::ManagedIdentityCredential::new(Some(
+                azure_identity::ManagedIdentityCredentialOptions {
+                    user_assigned_id: id,
+                    ..Default::default()
+                },
+            ))?)
+        }
+        AzureCredential::AzureCli => Ok(azure_identity::AzureCliCredential::new(None)?),
+        AzureCredential::ClientSecret => {
+            // Named, never echoed: a missing variable is reported by name only.
+            let var = |name: &str| {
+                std::env::var(name).map_err(|_| anyhow::anyhow!("azure: {name} is not set"))
             };
-            if !retry || attempt >= ATTEMPTS {
-                return result;
-            }
-            tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt))).await;
+            Ok(azure_identity::ClientSecretCredential::new(
+                &var("AZURE_TENANT_ID")?,
+                var("AZURE_CLIENT_ID")?,
+                var("AZURE_CLIENT_SECRET")?.into(),
+                None,
+            )?)
         }
     }
+}
 
-    /// One conditional `Put Blob` from memory.
-    async fn put_blob(&self, key: &str, data: Bytes, opts: &PutOptions) -> Result<ObjectMeta> {
-        let len = data.len() as u64;
-        let mut req = Request::new(Method::PUT, Some(key));
-        req.content_length = len;
-        req.content_type = opts.content_type;
-        req.ms_headers
-            .push(("x-ms-blob-type", "BlockBlob".to_owned()));
-        if opts.immutable {
-            req.ms_headers.push((
-                "x-ms-blob-cache-control",
-                "public, max-age=31536000, immutable".to_owned(),
-            ));
-        }
-        apply_mode(&mut req, &opts.mode);
-        let resp = self
-            .send_retrying(&req, || Some(reqwest::Body::from(data.clone())))
-            .await?;
-        self.written(key, len, resp).await
-    }
+#[derive(Debug)]
+struct BlobAuthorization;
 
-    /// A large object as blocks, committed by one conditional `Put Block List`.
-    async fn put_blocks(&self, key: &str, body: PutBody, opts: &PutOptions) -> Result<ObjectMeta> {
-        use tokio::io::AsyncReadExt;
-        let (mut reader, len): (Box<dyn tokio::io::AsyncRead + Unpin + Send>, u64) = match body {
-            PutBody::Bytes(b) => {
-                let len = b.len() as u64;
-                (Box::new(std::io::Cursor::new(b)), len)
-            }
-            PutBody::Stream { len, stream } => (
-                Box::new(tokio_util::io::StreamReader::new(
-                    stream.map(|r| r.map_err(std::io::Error::other)),
-                )),
-                len,
-            ),
-            PutBody::File(path) => {
-                let file = tokio::fs::File::open(&path).await.map_err(|e| {
-                    StoreError::other(anyhow::anyhow!("open {}: {e}", path.display()))
-                })?;
-                let len = file
-                    .metadata()
-                    .await
-                    .map_err(|e| {
-                        StoreError::other(anyhow::anyhow!("stat {}: {e}", path.display()))
-                    })?
-                    .len();
-                (Box::new(file), len)
-            }
-        };
-        let part = usize::try_from(self.multipart_part_size).map_err(StoreError::other)?;
-        let prefix = uuid::Uuid::new_v4().simple().to_string();
-        let mut ids = Vec::new();
-        let mut sent = 0u64;
-        loop {
-            let mut buf = Vec::with_capacity(part);
-            (&mut reader)
-                .take(part as u64)
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| StoreError::other(anyhow::anyhow!("azure block read: {e}")))?;
-            if buf.is_empty() {
-                break;
-            }
-            sent += buf.len() as u64;
-            // Block ids: base64, all the same length within one blob.
-            let id = BASE64.encode(format!("{prefix}-{:08}", ids.len()));
-            let data = Bytes::from(buf);
-            let mut req = Request::new(Method::PUT, Some(key));
-            req.query = vec![("comp", "block".to_owned()), ("blockid", id.clone())];
-            req.content_length = data.len() as u64;
-            let resp = self
-                .send_retrying(&req, || Some(reqwest::Body::from(data.clone())))
-                .await?;
-            if !resp.status().is_success() {
-                return Err(error_from(key, resp).await);
-            }
-            ids.push(id);
-        }
-        if sent != len {
-            return Err(StoreError::other(anyhow::anyhow!(
-                "azure put {key}: body was {sent} bytes, declared {len}"
-            )));
-        }
-        let mut list = String::new();
-        for id in &ids {
-            let _ = write!(list, "<Latest>{id}</Latest>");
-        }
-        let xml = Bytes::from(format!(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>{list}</BlockList>"
-        ));
-        let mut req = Request::new(Method::PUT, Some(key));
-        req.query = vec![("comp", "blocklist".to_owned())];
-        req.content_length = xml.len() as u64;
-        req.content_type = Some("application/xml");
-        if let Some(ct) = opts.content_type {
-            req.ms_headers
-                .push(("x-ms-blob-content-type", ct.to_owned()));
-        }
-        if opts.immutable {
-            req.ms_headers.push((
-                "x-ms-blob-cache-control",
-                "public, max-age=31536000, immutable".to_owned(),
-            ));
-        }
-        apply_mode(&mut req, &opts.mode);
-        let resp = self
-            .send_retrying(&req, || Some(reqwest::Body::from(xml.clone())))
-            .await?;
-        self.written(key, len, resp).await
-    }
-
-    /// The meta of a successful write, or the write's error.
-    async fn written(&self, key: &str, len: u64, resp: reqwest::Response) -> Result<ObjectMeta> {
-        if resp.status().is_success() {
-            return Ok(ObjectMeta {
-                key: key.into(),
-                size: len,
-                version: Version::new(etag(&resp).unwrap_or_default()),
-            });
-        }
-        let mut err = error_from(key, resp).await;
-        if let StoreError::PreconditionFailed { current, .. } = &mut err
-            && current.is_none()
-        {
-            *current = self.head(key).await.ok().flatten().map(|m| m.version);
-        }
-        Err(err)
-    }
-
-    /// One page of `List Blobs`.
-    async fn list_page(
+#[async_trait]
+impl OnRequest for BlobAuthorization {
+    async fn on_request(
         &self,
-        prefix: &str,
-        marker: Option<&str>,
-        delimiter: bool,
-    ) -> Result<ListPage> {
-        let mut req = Request::new(Method::GET, None);
-        req.query = vec![
-            ("restype", "container".to_owned()),
-            ("comp", "list".to_owned()),
-            ("maxresults", LIST_PAGE.to_string()),
-        ];
-        if !prefix.is_empty() {
-            req.query.push(("prefix", prefix.to_owned()));
+        context: &mut Context,
+        request: &mut Request,
+        authorizer: &dyn Authorizer,
+    ) -> azure_core::Result<()> {
+        authorizer
+            .authorize(
+                request,
+                &[STORAGE_SCOPE],
+                TokenRequestOptions {
+                    method_options: ClientMethodOptions {
+                        context: context.clone(),
+                    },
+                },
+            )
+            .await?;
+        if request.headers().get_optional_str(&COPY_SOURCE).is_some() {
+            let value = request.headers().get_str(&AUTHORIZATION)?.to_owned();
+            request.insert_header("x-ms-copy-source-authorization", value);
         }
-        if let Some(m) = marker {
-            req.query.push(("marker", m.to_owned()));
-        }
-        if delimiter {
-            req.query.push(("delimiter", "/".to_owned()));
-        }
-        let resp = self.send_retrying(&req, || None).await?;
-        if !resp.status().is_success() {
-            return Err(error_from(prefix, resp).await);
-        }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("azure list body: {e}")))?;
-        parse_list(&text)
+        Ok(())
     }
 }
 
-fn apply_mode(req: &mut Request<'_>, mode: &PutMode) {
-    match mode {
-        PutMode::Overwrite => {}
-        PutMode::Create => req.if_none_match = Some("*".to_owned()),
-        PutMode::Update(v) => req.if_match = Some(format!("\"{}\"", v.as_str())),
-    }
+fn status_of(error: &azure_core::Error) -> Option<StatusCode> {
+    error.http_status()
 }
 
-fn etag(resp: &reqwest::Response) -> Option<String> {
-    resp.headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_matches('"').to_owned())
-}
-
-fn header_u64(resp: &reqwest::Response, name: &str) -> Option<u64> {
-    resp.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse().ok())
-}
-
-fn is_transient_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-}
-
-/// The store error for a failed response: not found, a failed condition, a transient
-/// failure worth retrying, or a permanent one.
-async fn error_from(key: &str, resp: reqwest::Response) -> StoreError {
-    let status = resp.status();
-    let code = resp
-        .headers()
-        .get("x-ms-error-code")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    let current = etag(&resp).map(Version::new);
-    match (status.as_u16(), code.as_str()) {
-        (404, _) => StoreError::NotFound { key: key.into() },
-        (412, _) | (409, "BlobAlreadyExists") => StoreError::PreconditionFailed {
+fn map_error(key: &str, error: &azure_core::Error) -> StoreError {
+    // Do not propagate SDK error bodies/URLs: SAS signatures and copy-source
+    // credentials can occur there. Status and Azure error code suffice to diagnose.
+    match error.kind() {
+        ErrorKind::HttpResponse {
+            status: StatusCode::NotFound,
+            ..
+        } => StoreError::NotFound { key: key.into() },
+        ErrorKind::HttpResponse {
+            status: StatusCode::PreconditionFailed,
+            ..
+        } => StoreError::PreconditionFailed {
             key: key.into(),
-            current,
+            current: None,
         },
-        _ if is_transient_status(status) => {
-            StoreError::Retryable(anyhow::anyhow!("azure {key}: status {status} {code}"))
+        ErrorKind::HttpResponse {
+            status: StatusCode::Conflict,
+            error_code: Some(code),
+            ..
+        } if code == "BlobAlreadyExists" => StoreError::PreconditionFailed {
+            key: key.into(),
+            current: None,
+        },
+        // Transient container state; other 409 codes (lease, snapshot) are real faults.
+        ErrorKind::HttpResponse {
+            status: StatusCode::Conflict,
+            error_code: Some(code),
+            ..
+        } if code == "ContainerBeingDeleted" => StoreError::retryable(anyhow::anyhow!(
+            "azure: {key}: HTTP 409 (ContainerBeingDeleted)"
+        )),
+        ErrorKind::HttpResponse {
+            status, error_code, ..
+        } => {
+            let message = anyhow::anyhow!(
+                "azure: {key}: HTTP {status} ({})",
+                error_code.as_deref().unwrap_or("unknown")
+            );
+            if status.is_server_error()
+                || *status == StatusCode::TooManyRequests
+                || *status == StatusCode::RequestTimeout
+            {
+                StoreError::retryable(message)
+            } else {
+                StoreError::other(message)
+            }
         }
-        _ => {
-            let body = resp.text().await.unwrap_or_default();
-            let detail: String = body.chars().take(300).collect();
-            StoreError::Other(anyhow::anyhow!(
-                "azure {key}: status {status} {code} {detail}"
-            ))
+        ErrorKind::Connection | ErrorKind::Io => {
+            StoreError::retryable(anyhow::anyhow!("azure: {key}: transport error"))
         }
+        _ => StoreError::other(anyhow::anyhow!("azure: {key}: SDK error")),
     }
 }
 
-#[async_trait::async_trait]
+fn version_of(etag: Option<Etag>) -> Result<Version> {
+    match etag {
+        Some(etag) if !etag.to_string().is_empty() => Ok(Version::new(etag.to_string())),
+        _ => Err(StoreError::other(anyhow::anyhow!(
+            "azure: missing object ETag"
+        ))),
+    }
+}
+
+fn etag(v: &Version) -> Etag {
+    Etag::from(v.as_str())
+}
+fn required_size(size: Option<u64>) -> Result<u64> {
+    size.ok_or_else(|| StoreError::other(anyhow::anyhow!("azure: missing object length")))
+}
+
+#[async_trait]
 impl ObjectStore for AzureStore {
     fn backend(&self) -> &'static str {
         "azure"
     }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
-        let mut req = Request::new(Method::GET, Some(key));
-        req.if_none_match = opts
-            .if_none_match
-            .as_ref()
-            .map(|v| format!("\"{}\"", v.as_str()));
-        req.if_match = opts
-            .if_match
-            .as_ref()
-            .map(|v| format!("\"{}\"", v.as_str()));
+        let mut request = Request::new(self.blob(key).url().clone(), Method::Get);
+        request.insert_header("x-ms-version", AZURE_API_VERSION);
+        if let Some(v) = &opts.if_match {
+            request.insert_header("if-match", v.as_str().to_owned());
+        }
+        if let Some(v) = &opts.if_none_match {
+            request.insert_header("if-none-match", v.as_str().to_owned());
+        }
         if let Some(r) = &opts.range {
             if r.end <= r.start {
-                return Err(StoreError::InvalidArgument(format!(
-                    "empty range {}..{} on {key}",
-                    r.start, r.end
-                )));
+                return Err(StoreError::InvalidArgument(
+                    "azure: range must be non-empty and increasing".into(),
+                ));
             }
-            req.ms_headers
-                .push(("x-ms-range", format!("bytes={}-{}", r.start, r.end - 1)));
+            request.insert_header("range", format!("bytes={}-{}", r.start, r.end - 1));
         }
-        let resp = self.send_retrying(&req, || None).await?;
-        match resp.status().as_u16() {
-            200 | 206 => {
-                // `ObjectMeta::size` is the whole object, also for a range read.
-                let total = resp
-                    .headers()
-                    .get("content-range")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.rsplit_once('/'))
-                    .and_then(|(_, t)| t.trim().parse::<u64>().ok());
-                let meta = ObjectMeta {
-                    key: key.into(),
-                    size: total
-                        .or_else(|| header_u64(&resp, "content-length"))
-                        .unwrap_or(0),
-                    version: Version::new(etag(&resp).unwrap_or_default()),
-                };
-                let body = resp
-                    .bytes_stream()
-                    .map(|r| {
-                        r.map_err(|e| StoreError::retryable(anyhow::anyhow!("azure body: {e}")))
-                    })
-                    .boxed();
-                Ok(GetResult::Object { meta, body })
+        let result = match self
+            .pipeline
+            .stream(&Context::new(), &mut request, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if status_of(&e) == Some(StatusCode::NotModified) => {
+                return opts
+                    .if_none_match
+                    .map(|version| GetResult::NotModified { version })
+                    .ok_or_else(|| StoreError::other(anyhow::anyhow!("azure: unexpected 304")));
             }
-            304 => Ok(GetResult::NotModified {
-                version: Version::new(etag(&resp).unwrap_or_default()),
-            }),
-            _ => Err(error_from(key, resp).await),
-        }
+            Err(e) => return Err(map_error(key, &e)),
+        };
+        let headers = result.headers();
+        let version = version_of(headers.get_optional_str(&ETAG).map(Etag::from))?;
+        let size = if result.status() == StatusCode::PartialContent {
+            headers
+                .get_optional_str(&CONTENT_RANGE)
+                .and_then(|v| v.rsplit_once('/'))
+                .and_then(|(_, s)| s.parse().ok())
+        } else {
+            headers
+                .get_optional_str(&CONTENT_LENGTH)
+                .and_then(|s| s.parse().ok())
+        };
+        let size = required_size(size)?;
+        let key_owned = key.to_owned();
+        Ok(GetResult::Object {
+            meta: ObjectMeta {
+                key: key.into(),
+                size,
+                version,
+            },
+            body: result
+                .into_body()
+                .map(move |c| c.map_err(|e| map_error(&key_owned, &e)))
+                .boxed(),
+        })
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        let req = Request::new(Method::HEAD, Some(key));
-        let resp = self.send_retrying(&req, || None).await?;
-        match resp.status().as_u16() {
-            200 => Ok(Some(ObjectMeta {
+        match self.blob(key).get_properties(None).await {
+            Ok(r) => Ok(Some(ObjectMeta {
                 key: key.into(),
-                size: header_u64(&resp, "content-length").unwrap_or(0),
-                version: Version::new(etag(&resp).unwrap_or_default()),
+                size: required_size(r.content_length().map_err(|e| map_error(key, &e))?)?,
+                version: version_of(r.etag().map_err(|e| map_error(key, &e))?)?,
             })),
-            404 => Ok(None),
-            _ => Err(error_from(key, resp).await),
+            Err(e) if status_of(&e) == Some(StatusCode::NotFound) => Ok(None),
+            Err(e) => Err(map_error(key, &e)),
         }
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
-        let len = match &body {
-            PutBody::Bytes(b) => b.len() as u64,
-            PutBody::Stream { len, .. } => *len,
-            PutBody::File(path) => tokio::fs::metadata(path)
-                .await
-                .map_err(|e| StoreError::other(anyhow::anyhow!("stat {}: {e}", path.display())))?
-                .len(),
-        };
-        if len > self.multipart_threshold {
-            return self.put_blocks(key, body, &opts).await;
-        }
-        let data =
-            match body {
-                PutBody::Bytes(b) => b,
-                PutBody::Stream { len, stream } => {
-                    util::collect(stream, usize::try_from(len).map_err(StoreError::other)?).await?
+        // Every body at or below the threshold is one request: a pack push is a
+        // `File`, and staging it would pay a block plus a commit for a few KiB.
+        let small = |len: u64| len <= self.multipart_threshold;
+        match body {
+            PutBody::Bytes(bytes) if small(bytes.len() as u64) => {
+                self.put_single(key, bytes, &opts).await
+            }
+            PutBody::Stream { len, stream } if small(len) => {
+                let bytes = collect_exact(stream, len).await?;
+                self.put_single(key, bytes, &opts).await
+            }
+            PutBody::File(path) => {
+                let len = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(StoreError::other)?
+                    .len();
+                if small(len) {
+                    let file = tokio::fs::File::open(&path)
+                        .await
+                        .map_err(StoreError::other)?;
+                    let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)
+                        .map(|r| r.map_err(StoreError::other))
+                        .boxed();
+                    let bytes = collect_exact(stream, len).await?;
+                    self.put_single(key, bytes, &opts).await
+                } else {
+                    self.put_staged(key, PutBody::File(path), opts).await
                 }
-                PutBody::File(path) => Bytes::from(tokio::fs::read(&path).await.map_err(|e| {
-                    StoreError::other(anyhow::anyhow!("read {}: {e}", path.display()))
-                })?),
-            };
-        self.put_blob(key, data, &opts).await
+            }
+            other => self.put_staged(key, other, opts).await,
+        }
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
-        let mut req = Request::new(Method::DELETE, Some(key));
-        req.if_match = if_version.as_ref().map(|v| format!("\"{}\"", v.as_str()));
-        let resp = self.send_retrying(&req, || None).await?;
-        let status = resp.status().as_u16();
-        if resp.status().is_success() || (status == 404 && if_version.is_none()) {
-            return Ok(());
-        }
-        // A conditional delete of an absent blob fails its `If-Match` (412) before it
-        // finds nothing: report it as absent, as the other backends do.
-        match error_from(key, resp).await {
-            StoreError::PreconditionFailed { .. } if self.head(key).await?.is_none() => {
-                Err(StoreError::NotFound { key: key.into() })
+        let options = BlobClientDeleteOptions {
+            if_match: if_version.as_ref().map(etag),
+            ..Default::default()
+        };
+        match self
+            .writer(key, if_version.is_some())
+            .delete(Some(options))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if status_of(&e) == Some(StatusCode::NotFound) && if_version.is_none() => Ok(()),
+            Err(e)
+                if status_of(&e) == Some(StatusCode::PreconditionFailed)
+                    && if_version.is_some() =>
+            {
+                // Azure can return 412 for both a missing blob and a stale ETag.
+                // Disambiguate only on failure; never race HEAD against DELETE.
+                if self.head(key).await?.is_none() {
+                    Err(StoreError::NotFound { key: key.into() })
+                } else {
+                    Err(map_error(key, &e))
+                }
             }
-            e => Err(e),
+            Err(e) => Err(map_error(key, &e)),
         }
     }
 
@@ -809,344 +592,609 @@ impl ObjectStore for AzureStore {
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let store = AzureStore {
-            http: self.http.clone(),
-            account: self.account.clone(),
-            container: self.container.clone(),
-            multipart_threshold: self.multipart_threshold,
-            multipart_part_size: self.multipart_part_size,
+        let prefix = prefix.to_owned();
+        let start_after = start_after.map(str::to_owned);
+        let options = BlobContainerClientListBlobsOptions {
+            prefix: Some(prefix.clone()),
+            maxresults: Some(MAX_PAGE),
+            start_from: start_after.clone(),
+            include: Some(vec![ListBlobsIncludeItem::Metadata]),
+            ..Default::default()
         };
-        let state = ListState {
-            store,
-            prefix: prefix.to_owned(),
-            start_after: start_after.map(str::to_owned),
-            marker: None,
-            started: false,
-            buffer: Vec::new().into_iter(),
-        };
-        Box::pin(futures::stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(item) = state.buffer.next() {
-                    return Some((Ok(item), state));
-                }
-                if state.started && state.marker.is_none() {
-                    return None;
-                }
-                state.started = true;
-                match state
-                    .store
-                    .list_page(&state.prefix, state.marker.as_deref(), false)
-                    .await
-                {
-                    Ok(page) => {
-                        state.marker = page.next_marker;
-                        let after = state.start_after.clone();
-                        state.buffer = page
-                            .blobs
-                            .into_iter()
-                            .filter(|m| after.as_deref().is_none_or(|a| m.key.as_str() > a))
-                            .collect::<Vec<_>>()
-                            .into_iter();
-                    }
-                    Err(e) => {
-                        state.marker = None;
-                        return Some((Err(e), state));
-                    }
-                }
+        let pager = match self.container.list_blobs(Some(options)) {
+            Ok(p) => p,
+            Err(e) => {
+                return futures::stream::once(async move { Err(map_error(&prefix, &e)) }).boxed();
             }
-        }))
+        };
+        pager
+            .into_pages()
+            .map(move |page| {
+                let prefix = prefix.clone();
+                let start_after = start_after.clone();
+                async move {
+                    let page = page.map_err(|e| map_error(&prefix, &e))?;
+                    let body: azure_storage_blob::models::ListBlobsResponse =
+                        page.into_body().xml().map_err(|e| map_error(&prefix, &e))?;
+                    let mut out = Vec::new();
+                    for item in body.blob_items {
+                        let name = item.name.ok_or_else(|| {
+                            StoreError::other(anyhow::anyhow!("azure: listing missing name"))
+                        })?;
+                        // Also enforce the bound on emulators that ignore startFrom.
+                        if start_after.as_ref().is_some_and(|start| &name <= start) {
+                            continue;
+                        }
+                        // A hierarchical namespace account lists every directory of a
+                        // key as a zero-length blob marked `hdi_isfolder`.
+                        if is_directory(item.metadata.as_ref()) {
+                            continue;
+                        }
+                        let props = item.properties.ok_or_else(|| {
+                            StoreError::other(anyhow::anyhow!("azure: listing missing properties"))
+                        })?;
+                        out.push(ObjectMeta {
+                            key: name,
+                            size: required_size(props.content_length)?,
+                            version: version_of(props.etag)?,
+                        });
+                    }
+                    Ok::<_, StoreError>(out)
+                }
+            })
+            .buffered(1)
+            .map_ok(|items| futures::stream::iter(items.into_iter().map(Ok)))
+            .try_flatten()
+            .boxed()
     }
 
     async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            return Err(StoreError::InvalidArgument(
+                "azure: prefix must end in /".into(),
+            ));
+        }
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let page = self.list_page(prefix, marker.as_deref(), true).await?;
-            out.extend(page.prefixes);
-            marker = page.next_marker;
-            if marker.is_none() {
-                break;
+            let (mut prefixes, next) = self.list_delimited(prefix, marker.as_deref()).await?;
+            out.append(&mut prefixes);
+            match next.filter(|m| !m.is_empty()) {
+                Some(next) if marker.as_ref() != Some(&next) => marker = Some(next),
+                Some(_) => {
+                    return Err(StoreError::other(anyhow::anyhow!(
+                        "azure: listing repeated continuation marker"
+                    )));
+                }
+                None => break,
             }
         }
         out.sort();
         out.dedup();
         Ok(out)
     }
+
+    fn supports_compose(&self) -> bool {
+        true
+    }
+    fn compose_is_native(&self) -> bool {
+        false
+    }
+
+    async fn compose(
+        &self,
+        dest: &str,
+        sources: &[String],
+        opts: PutOptions,
+    ) -> Result<ObjectMeta> {
+        let block = self.blob(dest).block_blob_client();
+        let upload = Uuid::new_v4();
+        let mut blocks = Vec::new();
+        let mut total = 0u64;
+        let part_size = (self.multipart_part_size as u64).min(MAX_COPY_BYTES);
+        for source in sources {
+            let meta = self
+                .head(source)
+                .await?
+                .ok_or_else(|| StoreError::NotFound { key: source.into() })?;
+            let url = self.blob(source).url().to_string(); // preserves SAS and percent-encodes object keys
+            let ranges =
+                (0..meta.size).step_by(usize::try_from(part_size).map_err(StoreError::other)?);
+            let start_index = blocks.len();
+            let ids: Vec<_> = (0..meta.size.div_ceil(part_size))
+                .map(|i| {
+                    block_id(
+                        upload,
+                        start_index + usize::try_from(i).map_err(StoreError::other)?,
+                    )
+                })
+                .collect::<Result<_>>()?;
+            futures::stream::iter(ids.clone().into_iter().zip(ranges))
+                .map(|(id, start)| {
+                    let range = start..start.saturating_add(part_size).min(meta.size);
+                    let options = BlockBlobClientStageBlockFromUrlOptions {
+                        source_if_match: Some(etag(&meta.version)),
+                        source_range: Some(HttpRange::from(range)),
+                        ..Default::default()
+                    };
+                    let block = &block;
+                    let url = url.clone();
+                    async move {
+                        // The HTTP request has no body: content-length is ZERO, not the copied range length.
+                        block
+                            .stage_block_from_url(&id, 0, url, Some(options))
+                            .await
+                            .map_err(|e| map_error(source, &e))?;
+                        Ok::<_, StoreError>(())
+                    }
+                })
+                .buffer_unordered(self.max_concurrent_blocks)
+                .try_collect::<Vec<_>>()
+                .await?;
+            total = total.checked_add(meta.size).ok_or_else(|| {
+                StoreError::InvalidArgument("azure: compose size overflow".into())
+            })?;
+            blocks.extend(ids);
+        }
+        if blocks.is_empty() {
+            return self.put(dest, PutBody::Bytes(Bytes::new()), opts).await;
+        }
+        self.commit(dest, blocks, total, &opts).await
+    }
+
+    /// A read-only user-delegation SAS URL: signed with a key the account
+    /// issues to this identity, never with a shared key walgit does not hold.
+    /// The returned string is a credential for that one blob until `ttl` passes.
+    async fn signed_get_url(&self, key: &str, ttl: std::time::Duration) -> Result<Option<String>> {
+        let Some(signing) = &self.signing else {
+            return Ok(None);
+        };
+        let ttl = Duration::try_from(ttl).map_err(|_| {
+            StoreError::InvalidArgument("azure: signed URL ttl out of range".into())
+        })?;
+        if ttl <= Duration::ZERO || ttl.saturating_add(SAS_CLOCK_SKEW) > DELEGATION_KEY_MAX_LIFETIME
+        {
+            return Err(StoreError::InvalidArgument(
+                "azure: signed URL ttl must be positive and under seven days".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let expiry = now.saturating_add(ttl);
+        let delegation = &self.delegation_key(key, now, expiry).await?.key;
+        let sas = Sas {
+            permissions: "r",
+            start: sas_time(now.saturating_sub(SAS_CLOCK_SKEW)),
+            expiry: sas_time(expiry),
+            resource: format!("/blob/{}/{}/{key}", signing.account, signing.container),
+            protocol: "https",
+            resource_type: "b",
+        };
+        let signature = sas.sign(delegation)?;
+        let mut url = self.blob(key).url().clone();
+        {
+            let mut q = url.query_pairs_mut();
+            q.clear()
+                .append_pair("sv", SAS_VERSION)
+                .append_pair("spr", sas.protocol)
+                .append_pair("st", &sas.start)
+                .append_pair("se", &sas.expiry)
+                .append_pair("sr", sas.resource_type)
+                .append_pair("sp", sas.permissions)
+                .append_pair("skoid", &delegation.oid)
+                .append_pair("sktid", &delegation.tid)
+                .append_pair("skt", &delegation.start)
+                .append_pair("ske", &delegation.expiry)
+                .append_pair("sks", &delegation.service)
+                .append_pair("skv", &delegation.version)
+                .append_pair("sig", &signature);
+        }
+        Ok(Some(url.into()))
+    }
+
+    /// Under identity auth a one-hour read SAS, as S3 hands the edge a presigned
+    /// URL; under SAS auth the blob URL already carries the configured token,
+    /// which a trusted edge may hold as GCS's edge holds this process's bearer.
+    /// `Range` is not a signed header either way, so the edge may slice.
+    async fn accel_target(&self, key: &str) -> Option<crate::AccelTarget> {
+        let url = if self.sas_auth {
+            self.blob(key).url().to_string()
+        } else {
+            self.signed_get_url(key, std::time::Duration::from_hours(1))
+                .await
+                .ok()
+                .flatten()?
+        };
+        Some(crate::AccelTarget {
+            url,
+            authorization: None,
+        })
+    }
 }
 
-/// State of the lazy list stream.
-struct ListState {
-    store: AzureStore,
-    prefix: String,
-    start_after: Option<String>,
-    marker: Option<String>,
-    started: bool,
-    buffer: std::vec::IntoIter<ObjectMeta>,
+impl AzureStore {
+    /// A delegation key covering a URL that expires at `until`: the cached one
+    /// when it still reaches, else one request for a fresh key. Racing callers
+    /// may both fetch; either key verifies, and the lock is never held across
+    /// the round trip.
+    async fn delegation_key(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        until: OffsetDateTime,
+    ) -> Result<Arc<CachedDelegationKey>> {
+        if let Some(cached) = self.delegation_key.lock().clone()
+            && cached.expires_at >= until
+        {
+            return Ok(cached);
+        }
+        let Some(signing) = &self.signing else {
+            return Err(StoreError::other(anyhow::anyhow!(
+                "azure: signing unavailable"
+            )));
+        };
+        let expires_at = now.saturating_add(DELEGATION_KEY_LIFETIME).max(until);
+        let mut url = signing.service_url.clone();
+        url.query_pairs_mut()
+            .append_pair("restype", "service")
+            .append_pair("comp", "userdelegationkey");
+        let mut request = Request::new(url, Method::Post);
+        request.insert_header("x-ms-version", AZURE_API_VERSION);
+        request.insert_header("content-type", "application/xml");
+        request.set_body(Bytes::from(format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><KeyInfo><Start>{}</Start><Expiry>{}</Expiry></KeyInfo>",
+            sas_time(now.saturating_sub(SAS_CLOCK_SKEW)),
+            sas_time(expires_at)
+        )));
+        let response = self
+            .pipeline
+            .send(&Context::new(), &mut request, None)
+            .await
+            .map_err(|e| map_error(key, &e))?;
+        let key: DelegationKey = quick_xml::de::from_reader(&*response.into_body())
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let expires_at = azure_core::time::parse_rfc3339(&key.expiry)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let cached = Arc::new(CachedDelegationKey { key, expires_at });
+        *self.delegation_key.lock() = Some(cached.clone());
+        Ok(cached)
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+        marker: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let mut url = self.container.url().clone();
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("restype", "container")
+                .append_pair("comp", "list")
+                .append_pair("delimiter", "/")
+                .append_pair("prefix", prefix)
+                .append_pair("maxresults", &MAX_PAGE.to_string());
+            if let Some(m) = marker {
+                q.append_pair("marker", m);
+            }
+        }
+        let mut request = Request::new(url, Method::Get);
+        request.insert_header("x-ms-version", AZURE_API_VERSION);
+        let response = self
+            .pipeline
+            .send(&Context::new(), &mut request, None)
+            .await
+            .map_err(|e| map_error(prefix, &e))?;
+        parse_blob_prefixes(&response.into_body())
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delimited listing")))
+    }
+
+    async fn put_staged(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        let (len, stream) = match body {
+            PutBody::Bytes(bytes) => (bytes.len() as u64, util::once(bytes)),
+            PutBody::Stream { len, stream } => (len, stream),
+            PutBody::File(path) => {
+                let file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(StoreError::other)?;
+                let len = file.metadata().await.map_err(StoreError::other)?.len();
+                (
+                    len,
+                    tokio_util::io::ReaderStream::with_capacity(file, self.multipart_part_size)
+                        .map(|r| r.map_err(StoreError::other))
+                        .boxed(),
+                )
+            }
+        };
+        if len.div_ceil(self.multipart_part_size as u64) > MAX_BLOCKS as u64 {
+            return Err(StoreError::InvalidArgument(
+                "azure: upload exceeds 50000 blocks; increase multipart_part_size".into(),
+            ));
+        }
+        let input = UploadChunks {
+            stream,
+            remaining: len,
+            pending: Bytes::new(),
+            part: self.multipart_part_size,
+        };
+        let chunks = futures::stream::try_unfold(input, |mut state| async move {
+            state
+                .next()
+                .await
+                .map(|chunk| chunk.map(|chunk| (chunk, state)))
+        });
+        let block = self.blob(key).block_blob_client();
+        let upload = Uuid::new_v4();
+        // At most concurrency parts plus one input chunk are retained. No task
+        // detaches: any stream/stage failure drops outstanding requests and never commits.
+        let indexed: Vec<_> = chunks
+            .enumerate()
+            .map(|(index, chunk)| {
+                let block = &block;
+                async move {
+                    let chunk = chunk?;
+                    let id = block_id(upload, index)?;
+                    block
+                        .stage_block(&id, chunk.len() as u64, chunk.into(), None)
+                        .await
+                        .map_err(|e| map_error(key, &e))?;
+                    Ok::<_, StoreError>((index, id))
+                }
+            })
+            .buffer_unordered(self.max_concurrent_blocks)
+            .try_collect()
+            .await?;
+        let mut indexed = indexed;
+        indexed.sort_by_key(|(i, _)| *i);
+        self.commit(
+            key,
+            indexed.into_iter().map(|(_, id)| id).collect(),
+            len,
+            &opts,
+        )
+        .await
+    }
+
+    async fn put_single(&self, key: &str, bytes: Bytes, opts: &PutOptions) -> Result<ObjectMeta> {
+        let len = bytes.len() as u64;
+        let options = BlockBlobClientUploadOptions {
+            if_match: match &opts.mode {
+                PutMode::Update(v) => Some(etag(v)),
+                _ => None,
+            },
+            if_none_match: matches!(opts.mode, PutMode::Create).then(|| Etag::from("*")),
+            blob_content_type: opts.content_type.map(Into::into),
+            blob_cache_control: opts
+                .immutable
+                .then(|| "public, max-age=31536000, immutable".into()),
+            // Prevent the SDK from starting a second managed multipart upload.
+            partition_size: NonZero::new(len.max(1)),
+            ..Default::default()
+        };
+        let result = self
+            .writer(key, !matches!(opts.mode, PutMode::Overwrite))
+            .block_blob_client()
+            .upload(bytes.into(), Some(options))
+            .await
+            .map_err(|e| map_error(key, &e))?;
+        Ok(ObjectMeta {
+            key: key.into(),
+            size: len,
+            version: version_of(result.etag)?,
+        })
+    }
+
+    async fn commit(
+        &self,
+        key: &str,
+        blocks: Vec<Vec<u8>>,
+        total: u64,
+        opts: &PutOptions,
+    ) -> Result<ObjectMeta> {
+        let lookup = BlockLookupList {
+            latest: Some(blocks),
+            ..Default::default()
+        };
+        let options = BlockBlobClientCommitBlockListOptions {
+            if_match: match &opts.mode {
+                PutMode::Update(v) => Some(etag(v)),
+                _ => None,
+            },
+            if_none_match: matches!(opts.mode, PutMode::Create).then(|| Etag::from("*")),
+            blob_content_type: opts.content_type.map(Into::into),
+            blob_cache_control: opts
+                .immutable
+                .then(|| "public, max-age=31536000, immutable".into()),
+            ..Default::default()
+        };
+        let result = self
+            .writer(key, !matches!(opts.mode, PutMode::Overwrite))
+            .block_blob_client()
+            .commit_block_list(
+                lookup
+                    .try_into()
+                    .map_err(|_| StoreError::other(anyhow::anyhow!("azure: invalid block list")))?,
+                Some(options),
+            )
+            .await
+            .map_err(|e| map_error(key, &e))?;
+        Ok(ObjectMeta {
+            key: key.into(),
+            size: total,
+            version: version_of(result.etag().map_err(|e| map_error(key, &e))?)?,
+        })
+    }
 }
 
-/// What one `List Blobs` page holds.
-#[derive(Debug, Default)]
-struct ListPage {
-    blobs: Vec<ObjectMeta>,
-    prefixes: Vec<String>,
+fn is_directory(metadata: Option<&azure_storage_blob::models::BlobMetadata>) -> bool {
+    metadata
+        .and_then(|m| m.values.as_ref())
+        .is_some_and(|values| {
+            values.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("hdi_isfolder") && v.eq_ignore_ascii_case("true")
+            })
+        })
+}
+
+fn block_id(upload: Uuid, index: usize) -> Result<Vec<u8>> {
+    if index >= MAX_BLOCKS {
+        return Err(StoreError::InvalidArgument(
+            "azure: upload exceeds 50000 blocks".into(),
+        ));
+    }
+    // A fresh upload namespace prevents two writers staging over each other;
+    // fixed-width IDs meet Azure's equal-length-per-blob requirement.
+    Ok(format!("{}-{index:05}", upload.simple()).into_bytes())
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "EnumerationResults")]
+struct DelimitedListing {
+    #[serde(rename = "Blobs")]
+    blobs: DelimitedBlobs,
+    #[serde(rename = "NextMarker")]
     next_marker: Option<String>,
 }
-
-/// Parse a `List Blobs` answer: `<Blob>` names, sizes and etags, `<BlobPrefix>` names, and
-/// the next marker. The schema is fixed and flat, so a scan for the few elements needed
-/// replaces an XML library.
-fn parse_list(xml: &str) -> Result<ListPage> {
-    let mut page = ListPage::default();
-    for blob in elements(xml, "Blob") {
-        let name = element(blob, "Name")
-            .ok_or_else(|| StoreError::other(anyhow::anyhow!("azure list: blob without name")))?;
-        let size = element(blob, "Content-Length")
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        let tag = element(blob, "Etag").unwrap_or_default();
-        page.blobs.push(ObjectMeta {
-            key: unescape(name),
-            size,
-            version: Version::new(unescape(tag).trim_matches('"').to_owned()),
-        });
-    }
-    for prefix in elements(xml, "BlobPrefix") {
-        if let Some(name) = element(prefix, "Name") {
-            page.prefixes.push(unescape(name));
-        }
-    }
-    page.next_marker = element(xml, "NextMarker")
-        .map(unescape)
-        .filter(|m| !m.is_empty());
-    Ok(page)
+#[derive(Deserialize)]
+struct DelimitedBlobs {
+    #[serde(rename = "BlobPrefix", default)]
+    prefixes: Vec<BlobPrefix>,
+}
+#[derive(Deserialize)]
+struct BlobPrefix {
+    #[serde(rename = "Name")]
+    name: String,
 }
 
-/// The inner text of every `<tag>…</tag>` in `xml`, in order.
-fn elements<'x>(xml: &'x str, tag: &str) -> Vec<&'x str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let Some(after) = rest.get(start + open.len()..) else {
-            break;
-        };
-        let Some(end) = after.find(&close) else {
-            break;
-        };
-        if let Some(inner) = after.get(..end) {
-            out.push(inner);
-        }
-        rest = after.get(end + close.len()..).unwrap_or("");
-    }
-    out
+/// The signed fields of one blob-scoped user delegation SAS.
+struct Sas {
+    permissions: &'static str,
+    start: String,
+    expiry: String,
+    resource: String,
+    protocol: &'static str,
+    resource_type: &'static str,
 }
 
-/// The inner text of the first `<tag>…</tag>` in `xml`.
-fn element<'x>(xml: &'x str, tag: &str) -> Option<&'x str> {
-    elements(xml, tag).into_iter().next()
+impl Sas {
+    /// The `sv = 2020-12-06` string-to-sign: unset optional fields stay as
+    /// empty lines, and the key's own fields are the service's verbatim strings.
+    fn string_to_sign(&self, key: &DelegationKey) -> String {
+        [
+            self.permissions,
+            &self.start,
+            &self.expiry,
+            &self.resource,
+            &key.oid,
+            &key.tid,
+            &key.start,
+            &key.expiry,
+            &key.service,
+            &key.version,
+            "", // signedAuthorizedUserObjectId
+            "", // signedUnauthorizedUserObjectId
+            "", // signedCorrelationId
+            "", // signedIP
+            self.protocol,
+            SAS_VERSION,
+            self.resource_type,
+            "", // signedSnapshotTime
+            "", // signedEncryptionScope
+            "", // rscc
+            "", // rscd
+            "", // rsce
+            "", // rscl
+            "", // rsct
+        ]
+        .join("\n")
+    }
+
+    fn sign(&self, key: &DelegationKey) -> Result<String> {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let secret = engine
+            .decode(&key.value)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        mac.update(self.string_to_sign(key).as_bytes());
+        Ok(engine.encode(mac.finalize().into_bytes()))
+    }
 }
 
-/// Decode the XML entities a blob name or marker may carry.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(rest.get(..amp).unwrap_or(""));
-        let tail = rest.get(amp..).unwrap_or("");
-        let Some(semi) = tail.find(';') else {
-            out.push_str(tail);
-            return out;
-        };
-        let entity = tail.get(1..semi).unwrap_or("");
-        let decoded = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            e if e.starts_with("#x") => e
-                .get(2..)
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .and_then(char::from_u32),
-            e if e.starts_with('#') => e
-                .get(1..)
-                .and_then(|d| d.parse::<u32>().ok())
-                .and_then(char::from_u32),
-            _ => None,
-        };
-        match decoded {
-            Some(c) => out.push(c),
-            None => out.push_str(tail.get(..=semi).unwrap_or("")),
+/// `YYYY-MM-DDThh:mm:ssZ`, the only form a SAS accepts; `t` is UTC.
+fn sas_time(t: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+fn parse_blob_prefixes(body: &[u8]) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let listing: DelimitedListing = quick_xml::de::from_reader(body)?;
+    Ok((
+        listing.blobs.prefixes.into_iter().map(|p| p.name).collect(),
+        listing.next_marker,
+    ))
+}
+
+/// Collect only the declared small body, rejecting overrun before accumulating it.
+async fn collect_exact(stream: ByteStream, len: u64) -> Result<Bytes> {
+    let mut input = UploadChunks {
+        stream,
+        remaining: len,
+        pending: Bytes::new(),
+        part: usize::try_from(len.max(1)).map_err(StoreError::other)?,
+    };
+    Ok(input.next().await?.unwrap_or_default())
+}
+
+struct UploadChunks {
+    stream: ByteStream,
+    remaining: u64,
+    pending: Bytes,
+    part: usize,
+}
+impl UploadChunks {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        let want = self
+            .part
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let mut out = BytesMut::with_capacity(want);
+        loop {
+            if self.pending.is_empty() {
+                self.pending = match self.stream.next().await {
+                    Some(chunk) => chunk?,
+                    None if self.remaining == 0 => {
+                        return Ok((!out.is_empty()).then(|| out.freeze()));
+                    }
+                    None => {
+                        return Err(StoreError::InvalidArgument(
+                            "azure: upload stream shorter than declared length".into(),
+                        ));
+                    }
+                };
+                if self.pending.len() as u64 > self.remaining {
+                    return Err(StoreError::InvalidArgument(
+                        "azure: upload stream longer than declared length".into(),
+                    ));
+                }
+                if self.pending.is_empty() {
+                    continue;
+                }
+            }
+            let take = self.pending.len().min(want - out.len());
+            out.extend_from_slice(&self.pending.split_to(take));
+            self.remaining -= take as u64;
+            // Check EOF before emitting the last part, so mismatched streams cannot commit.
+            if out.len() == want && self.remaining > 0 {
+                return Ok(Some(out.freeze()));
+            }
         }
-        rest = tail.get(semi + 1..).unwrap_or("");
     }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn azurite_connection_string_keeps_the_account_path() {
-        let a = Account::parse(
-            "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;",
-        )
-        .unwrap();
-        assert_eq!(a.name, "devstoreaccount1");
-        assert_eq!(a.endpoint, "http://127.0.0.1:10000/devstoreaccount1");
-        assert_eq!(a.endpoint_path, "/devstoreaccount1");
-    }
-
-    #[test]
-    fn azure_connection_string_builds_the_account_host() {
-        let a = Account::parse(
-            "DefaultEndpointsProtocol=https;AccountName=acme;AccountKey=a2V5;EndpointSuffix=core.windows.net",
-        )
-        .unwrap();
-        assert_eq!(a.endpoint, "https://acme.blob.core.windows.net");
-        assert_eq!(a.endpoint_path, "");
-    }
-
-    #[test]
-    fn list_pages_parse_blobs_prefixes_and_markers() {
-        let xml = "<EnumerationResults><Blobs><Blob><Name>a/b&amp;c</Name><Properties><Content-Length>12</Content-Length><Etag>\"0x8D1\"</Etag></Properties></Blob><BlobPrefix><Name>a/d/</Name></BlobPrefix></Blobs><NextMarker>m1</NextMarker></EnumerationResults>";
-        let page = parse_list(xml).unwrap();
-        assert_eq!(page.blobs.len(), 1);
-        assert_eq!(page.blobs[0].key, "a/b&c");
-        assert_eq!(page.blobs[0].size, 12);
-        assert_eq!(page.blobs[0].version.as_str(), "0x8D1");
-        assert_eq!(page.prefixes, vec!["a/d/".to_owned()]);
-        assert_eq!(page.next_marker.as_deref(), Some("m1"));
-        let last =
-            parse_list("<EnumerationResults><Blobs/><NextMarker /></EnumerationResults>").unwrap();
-        assert!(last.next_marker.is_none());
-    }
-
-    /// A token endpoint that checks the federated token exchange and hands out
-    /// `tok-<n>`, and a blob endpoint that answers only the latest token.
-    async fn fake_entra_and_blob(expires_in: u64) -> (String, Arc<std::sync::atomic::AtomicU64>) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let issued = Arc::new(AtomicU64::new(0));
-        let tokens = issued.clone();
-        let blobs = issued.clone();
-        let app = axum::Router::new()
-            .route(
-                "/tenant-1/oauth2/v2.0/token",
-                axum::routing::post(move |body: String| {
-                    let tokens = tokens.clone();
-                    async move {
-                        assert!(body.contains("grant_type=client_credentials"), "{body}");
-                        assert!(body.contains("client_id=client-1"), "{body}");
-                        assert!(body.contains("client_assertion=federated-jwt"), "{body}");
-                        assert!(
-                            body.contains("scope=https%3A%2F%2Fstorage.azure.com%2F.default"),
-                            "{body}"
-                        );
-                        let n = tokens.fetch_add(1, Ordering::SeqCst) + 1;
-                        format!(r#"{{"token_type":"Bearer","expires_in":{expires_in},"access_token":"tok-{n}"}}"#)
-                    }
-                }),
-            )
-            .route(
-                "/container/{key}",
-                axum::routing::get(move |headers: axum::http::HeaderMap| {
-                    let blobs = blobs.clone();
-                    async move {
-                        let want = format!("Bearer tok-{}", blobs.load(Ordering::SeqCst));
-                        let got = headers.get("authorization").and_then(|v| v.to_str().ok());
-                        if got != Some(want.as_str()) {
-                            return axum::http::Response::builder()
-                                .status(403)
-                                .body(axum::body::Body::empty())
-                                .unwrap();
-                        }
-                        axum::http::Response::builder()
-                            .header("etag", "\"0x1\"")
-                            .body(axum::body::Body::from("hello"))
-                            .unwrap()
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), issued)
-    }
-
-    fn workload_identity_store(base: &str, token_file: &std::path::Path) -> AzureStore {
-        let cfg = walgit_config::StoreConfig {
-            backend: walgit_config::StoreBackend::Azure,
-            bucket: "container".into(),
-            azure: AzureConfig {
-                auth: AzureAuth::WorkloadIdentity,
-                account: "acct".into(),
-                endpoint: base.to_owned(),
-                ..AzureConfig::default()
-            },
-            ..Default::default()
-        };
-        let identity = WorkloadIdentity::new(
-            &format!("{base}/"),
-            "tenant-1",
-            "client-1".into(),
-            token_file.to_owned(),
-        );
-        AzureStore::with_account(&cfg, Account::entra(&cfg.azure, identity).unwrap()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn workload_identity_sends_a_cached_bearer_token() {
-        use std::sync::atomic::Ordering;
-        let (base, issued) = fake_entra_and_blob(3600).await;
-        let dir = tempfile::tempdir().unwrap();
-        let token_file = dir.path().join("token");
-        std::fs::write(&token_file, "federated-jwt\n").unwrap();
-        let store = workload_identity_store(&base, &token_file);
-        for _ in 0..3 {
-            let meta = store.head("blob").await.unwrap().unwrap();
-            assert_eq!(meta.version.as_str(), "0x1");
-        }
-        assert_eq!(issued.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn workload_identity_refreshes_a_token_close_to_expiry() {
-        use std::sync::atomic::Ordering;
-        let (base, issued) = fake_entra_and_blob(60).await;
-        let dir = tempfile::tempdir().unwrap();
-        let token_file = dir.path().join("token");
-        std::fs::write(&token_file, "federated-jwt").unwrap();
-        let store = workload_identity_store(&base, &token_file);
-        store.head("blob").await.unwrap().unwrap();
-        store.head("blob").await.unwrap().unwrap();
-        assert_eq!(issued.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn workload_identity_endpoint_defaults_to_the_account_host() {
-        let cfg = AzureConfig {
-            auth: AzureAuth::WorkloadIdentity,
-            account: "acme".into(),
-            ..AzureConfig::default()
-        };
-        let identity = WorkloadIdentity::new(
-            "https://login.microsoftonline.com/",
-            "t",
-            "c".into(),
-            PathBuf::from("/nonexistent"),
-        );
-        assert_eq!(
-            identity.token_url,
-            "https://login.microsoftonline.com/t/oauth2/v2.0/token"
-        );
-        let a = Account::entra(&cfg, identity).unwrap();
-        assert_eq!(a.endpoint, "https://acme.blob.core.windows.net");
-        assert_eq!(a.endpoint_path, "");
-    }
-}
+mod tests;
