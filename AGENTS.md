@@ -507,6 +507,12 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   the log and the principal policy rules see. The front must overwrite the header on every request: walgit
   trusts whatever arrives. No other auth path changes.
 
+- **D54 (2026-10-07): Azure conditional writes are sent once, and listings skip directories.** A conditional
+  write (`If-Match`/`If-None-Match` upload, block list commit or delete) goes through a client without SDK retries:
+  a resent write whose first reply was lost meets its own committed write and answers 412, which callers read as a
+  lost race. Reads, listings and block staging keep the SDK retries. An account with a hierarchical namespace lists
+  every directory of a key as a zero-length blob marked `hdi_isfolder`; listings request metadata and skip them.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

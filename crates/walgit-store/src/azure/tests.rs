@@ -47,6 +47,18 @@ where
     F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = azure_core::Result<AsyncRawResponse>> + Send + 'static,
 {
+    fixture_with_retry(reply, credential, RetryOptions::none())
+}
+
+fn fixture_with_retry<F, Fut>(
+    reply: F,
+    credential: Option<Arc<dyn TokenCredential>>,
+    retry: RetryOptions,
+) -> (AzureStore, Arc<Mutex<Vec<Request>>>)
+where
+    F: Fn(Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = azure_core::Result<AsyncRawResponse>> + Send + 'static,
+{
     let calls = Arc::new(Mutex::new(Vec::new()));
     let client = FakeClient {
         calls: calls.clone(),
@@ -73,7 +85,7 @@ where
         credential,
         ClientOptions {
             transport: Some(Transport::new(Arc::new(client))),
-            retry: RetryOptions::none(),
+            retry,
             ..Default::default()
         },
     )
@@ -884,4 +896,76 @@ async fn undersized_small_body_declarations_stop_before_reading_more_input() {
     ));
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn flat_listing_skips_hierarchical_namespace_directories() {
+    let (store, calls) = fixture(
+        |r| async move {
+            assert_eq!(query(&r, "include").as_deref(), Some("metadata"));
+            Ok(response(
+                StatusCode::Ok,
+                "<EnumerationResults><Blobs>\
+                 <Blob><Name>r/wal</Name><Properties><Content-Length>0</Content-Length><Etag>dir</Etag><BlobType>BlockBlob</BlobType></Properties><Metadata><hdi_isfolder>true</hdi_isfolder></Metadata></Blob>\
+                 <Blob><Name>r/wal/1.pack</Name><Properties><Content-Length>3</Content-Length><Etag>file</Etag><BlobType>BlockBlob</BlobType></Properties><Metadata /></Blob>\
+                 </Blobs><NextMarker/></EnumerationResults>",
+                &[],
+            ))
+        },
+        None,
+    );
+    let objects = store
+        .list("r/wal", None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+        ["r/wal/1.pack"]
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn conditional_writes_are_sent_once_while_reads_retry() {
+    let retry = RetryOptions::exponential(azure_core::http::ExponentialRetryOptions {
+        initial_delay: Duration::milliseconds(1),
+        max_delay: Duration::milliseconds(2),
+        max_retries: 2,
+        ..Default::default()
+    });
+    let (store, calls) = fixture_with_retry(
+        |r| async move {
+            if query(&r, "comp").as_deref() == Some("block") {
+                return Ok(response(StatusCode::Created, Bytes::new(), &[]));
+            }
+            Ok(response(StatusCode::ServiceUnavailable, Bytes::new(), &[]))
+        },
+        None,
+        retry,
+    );
+    store
+        .put(
+            "k",
+            PutBody::Bytes(Bytes::from_static(b"abc")),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap_err();
+    let commits = |calls: &Mutex<Vec<Request>>| {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| query(r, "comp").as_deref() == Some("blocklist"))
+            .count()
+    };
+    assert_eq!(commits(&calls), 1, "a conditional commit is never resent");
+    let before = calls.lock().unwrap().len();
+    store.head("k").await.unwrap_err();
+    assert_eq!(
+        calls.lock().unwrap().len() - before,
+        3,
+        "a read is retried twice"
+    );
 }

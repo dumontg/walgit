@@ -16,18 +16,17 @@ use azure_core::error::ErrorKind;
 use azure_core::http::headers::{AUTHORIZATION, CONTENT_LENGTH, ETAG, HeaderName};
 use azure_core::http::policies::auth::{Authorizer, BearerTokenAuthorizationPolicy, OnRequest};
 use azure_core::http::{
-    ClientMethodOptions, ClientOptions, Context, Etag, Method, Pipeline, Request, StatusCode,
+    ClientMethodOptions, ClientOptions, Context, Etag, Method, Pipeline, Request, RetryOptions,
+    StatusCode,
 };
 use azure_core::time::{Duration, OffsetDateTime};
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientGetPropertiesResultHeaders,
     BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
     BlockBlobClientCommitBlockListResultHeaders, BlockBlobClientStageBlockFromUrlOptions,
-    BlockBlobClientUploadOptions, BlockLookupList, HttpRange,
+    BlockBlobClientUploadOptions, BlockLookupList, HttpRange, ListBlobsIncludeItem,
 };
-use azure_storage_blob::{
-    BlobClient, BlobContainerClient, BlobContainerClientOptions, BlockBlobClient,
-};
+use azure_storage_blob::{BlobClient, BlobContainerClient, BlobContainerClientOptions};
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -62,6 +61,10 @@ const DELEGATION_KEY_MAX_LIFETIME: Duration = Duration::days(7);
 
 pub struct AzureStore {
     container: Arc<BlobContainerClient>,
+    /// The same container without SDK retries, for conditional writes: a resent
+    /// conditional write whose first reply was lost meets its own committed write
+    /// and answers 412, which callers read as a lost race.
+    mutations: Arc<BlobContainerClient>,
     pipeline: Pipeline,
     /// `None` under SAS authentication (a user delegation key needs an Entra
     /// identity, and the configured SAS may grant more than a read) or when
@@ -179,6 +182,17 @@ impl AzureStore {
                 version: AZURE_API_VERSION.into(),
             }),
         )?;
+        let mutations = BlobContainerClient::new(
+            container.url().clone(),
+            None,
+            Some(BlobContainerClientOptions {
+                client_options: ClientOptions {
+                    retry: RetryOptions::none(),
+                    ..options.clone()
+                },
+                version: AZURE_API_VERSION.into(),
+            }),
+        )?;
         let pipeline = Pipeline::new(
             option_env!("CARGO_PKG_NAME"),
             option_env!("CARGO_PKG_VERSION"),
@@ -189,6 +203,7 @@ impl AzureStore {
         );
         Ok(Self {
             container: Arc::new(container),
+            mutations: Arc::new(mutations),
             pipeline,
             signing,
             delegation_key: parking_lot::Mutex::new(None),
@@ -201,6 +216,15 @@ impl AzureStore {
 
     fn blob(&self, key: &str) -> BlobClient {
         self.container.blob_client(key)
+    }
+
+    /// The client for a write: one without SDK retries when the write is conditional.
+    fn writer(&self, key: &str, conditional: bool) -> BlobClient {
+        if conditional {
+            self.mutations.blob_client(key)
+        } else {
+            self.blob(key)
+        }
     }
 }
 
@@ -532,7 +556,11 @@ impl ObjectStore for AzureStore {
             if_match: if_version.as_ref().map(etag),
             ..Default::default()
         };
-        match self.blob(key).delete(Some(options)).await {
+        match self
+            .writer(key, if_version.is_some())
+            .delete(Some(options))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) if status_of(&e) == Some(StatusCode::NotFound) && if_version.is_none() => Ok(()),
             Err(e)
@@ -562,6 +590,7 @@ impl ObjectStore for AzureStore {
             prefix: Some(prefix.clone()),
             maxresults: Some(MAX_PAGE),
             start_from: start_after.clone(),
+            include: Some(vec![ListBlobsIncludeItem::Metadata]),
             ..Default::default()
         };
         let pager = match self.container.list_blobs(Some(options)) {
@@ -586,6 +615,11 @@ impl ObjectStore for AzureStore {
                         })?;
                         // Also enforce the bound on emulators that ignore startFrom.
                         if start_after.as_ref().is_some_and(|start| &name <= start) {
+                            continue;
+                        }
+                        // A hierarchical namespace account lists every directory of a
+                        // key as a zero-length blob marked `hdi_isfolder`.
+                        if is_directory(item.metadata.as_ref()) {
                             continue;
                         }
                         let props = item.properties.ok_or_else(|| {
@@ -697,7 +731,7 @@ impl ObjectStore for AzureStore {
         if blocks.is_empty() {
             return self.put(dest, PutBody::Bytes(Bytes::new()), opts).await;
         }
-        self.commit(dest, &block, blocks, total, &opts).await
+        self.commit(dest, blocks, total, &opts).await
     }
 
     /// A read-only user-delegation SAS URL: signed with a key the account
@@ -904,7 +938,6 @@ impl AzureStore {
         indexed.sort_by_key(|(i, _)| *i);
         self.commit(
             key,
-            &block,
             indexed.into_iter().map(|(_, id)| id).collect(),
             len,
             &opts,
@@ -929,7 +962,7 @@ impl AzureStore {
             ..Default::default()
         };
         let result = self
-            .blob(key)
+            .writer(key, !matches!(opts.mode, PutMode::Overwrite))
             .block_blob_client()
             .upload(bytes.into(), Some(options))
             .await
@@ -944,7 +977,6 @@ impl AzureStore {
     async fn commit(
         &self,
         key: &str,
-        block: &BlockBlobClient,
         blocks: Vec<Vec<u8>>,
         total: u64,
         opts: &PutOptions,
@@ -965,7 +997,9 @@ impl AzureStore {
                 .then(|| "public, max-age=31536000, immutable".into()),
             ..Default::default()
         };
-        let result = block
+        let result = self
+            .writer(key, !matches!(opts.mode, PutMode::Overwrite))
+            .block_blob_client()
             .commit_block_list(
                 lookup
                     .try_into()
@@ -980,6 +1014,16 @@ impl AzureStore {
             version: version_of(result.etag().map_err(|e| map_error(key, &e))?)?,
         })
     }
+}
+
+fn is_directory(metadata: Option<&azure_storage_blob::models::BlobMetadata>) -> bool {
+    metadata
+        .and_then(|m| m.values.as_ref())
+        .is_some_and(|values| {
+            values.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("hdi_isfolder") && v.eq_ignore_ascii_case("true")
+            })
+        })
 }
 
 fn block_id(upload: Uuid, index: usize) -> Result<Vec<u8>> {
