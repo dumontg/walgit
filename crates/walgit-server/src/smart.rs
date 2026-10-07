@@ -19,6 +19,8 @@ use crate::stream::{VecWriter, body_to_async_read, maybe_gunzip, write_body_pipe
 use tracing::Instrument;
 
 const MAX_OBJECT_INFO_OIDS: usize = 1024;
+/// Remote pack header reads one object-info request may have in flight.
+const OBJECT_INFO_PARALLEL_READS: usize = 16;
 
 /// Cache-control headers for smart endpoints (info/refs and pkt responses).
 fn no_cache_headers() -> [(axum::http::HeaderName, &'static str); 3] {
@@ -370,48 +372,59 @@ async fn upload_pack_v2(
                 .iter()
                 .map(|hex| gix_hash::ObjectId::from_hex(hex.as_bytes()).ok())
                 .collect();
+            // Only found sizes are cached: a miss cached under a version read
+            // after the sync could hide an object pushed meanwhile.
             let sizes = match access {
                 walgit_wal::ObjectAccess::Local => {
-                    let repo = handle.local().gix();
-                    oids.iter()
-                        .map(|oid| {
-                            let Some(oid) = oid else { return None };
-                            if let Some(size) =
-                                st.caches.object_info.get(&repo_key, version.as_ref(), *oid)
-                            {
-                                return size;
-                            }
-                            let size = gix_object::FindHeader::try_header(&repo.objects, oid)
-                                .ok()
-                                .flatten()
-                                .map(|header| header.size);
-                            st.caches
-                                .object_info
-                                .insert(&repo_key, version.as_ref(), *oid, size);
-                            size
-                        })
-                        .collect()
+                    let local = handle.local().clone();
+                    let cache = st.caches.object_info.clone();
+                    let repo_key = repo_key.clone();
+                    let version = version.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let repo = local.gix();
+                        oids.iter()
+                            .map(|oid| {
+                                let oid = (*oid)?;
+                                if let Some(size) = cache.get(&repo_key, version.as_ref(), oid) {
+                                    return size;
+                                }
+                                let size = gix_object::FindHeader::try_header(&repo.objects, &oid)
+                                    .ok()
+                                    .flatten()
+                                    .map(|header| header.size);
+                                if size.is_some() {
+                                    cache.insert(&repo_key, version.as_ref(), oid, size);
+                                }
+                                size
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("object-info: {e}")))?
                 }
                 walgit_wal::ObjectAccess::Remote(packs) => {
-                    let results = futures::future::join_all(oids.iter().map(|oid| {
-                        let packs = packs.clone();
-                        let cache = st.caches.object_info.clone();
-                        let repo_key = repo_key.clone();
-                        let version = version.clone();
-                        async move {
-                            let Some(oid) = oid else { return Ok(None) };
-                            if let Some(size) = cache.get(&repo_key, version.as_ref(), *oid) {
-                                return Ok(size);
+                    use futures::stream::{StreamExt, TryStreamExt};
+                    futures::stream::iter(oids)
+                        .map(|oid| {
+                            let packs = packs.clone();
+                            let cache = st.caches.object_info.clone();
+                            let repo_key = repo_key.clone();
+                            let version = version.clone();
+                            async move {
+                                let Some(oid) = oid else { return Ok(None) };
+                                if let Some(size) = cache.get(&repo_key, version.as_ref(), oid) {
+                                    return Ok(size);
+                                }
+                                let size = packs.header(&oid).await?.map(|(_, size)| size);
+                                if size.is_some() {
+                                    cache.insert(&repo_key, version.as_ref(), oid, size);
+                                }
+                                Ok::<Option<u64>, walgit_wal::WalError>(size)
                             }
-                            let size = packs.header(oid).await?.map(|(_, size)| size);
-                            cache.insert(&repo_key, version.as_ref(), *oid, size);
-                            Ok::<Option<u64>, walgit_wal::WalError>(size)
-                        }
-                    }))
-                    .await;
-                    results
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()
+                        })
+                        .buffered(OBJECT_INFO_PARALLEL_READS)
+                        .try_collect::<Vec<_>>()
+                        .await
                         .map_err(wal_err)?
                 }
             };

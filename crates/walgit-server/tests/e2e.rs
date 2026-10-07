@@ -126,6 +126,76 @@ async fn object_info_v2_reports_missing_object_with_empty_size() -> TestResult {
     Ok(())
 }
 
+/// An object pushed after a lookup missed it is reported with its size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_finds_an_object_pushed_after_a_miss() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info-later").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "object-info-later"),
+        ],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    git_in(
+        &src,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "later",
+        ],
+    )?;
+    let oid = git_in(&src, &["rev-parse", "main"])?.trim().to_owned();
+    let size = git_in(&src, &["cat-file", "-s", &oid])?.trim().to_owned();
+
+    let before = request_object_info(
+        &server,
+        "t",
+        "object-info-later",
+        std::slice::from_ref(&oid),
+    )
+    .await?
+    .bytes()
+    .await?;
+    let missing = format!("{oid} \n");
+    assert!(
+        before
+            .windows(missing.len())
+            .any(|w| w == missing.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&before)
+    );
+
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let after = request_object_info(
+        &server,
+        "t",
+        "object-info-later",
+        std::slice::from_ref(&oid),
+    )
+    .await?
+    .bytes()
+    .await?;
+    let found = format!("{oid} {size}\n");
+    assert!(
+        after.windows(found.len()).any(|w| w == found.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&after)
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_info_v2_bounds_oid_count_before_sync() -> TestResult {
     let server = Server::start().await?;
