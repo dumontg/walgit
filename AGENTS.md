@@ -76,7 +76,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback or `unauthenticated_public_bind` is set for a front that authenticates and sends `X-Walgit-Principal`, D53),
+- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -508,12 +508,6 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 - **D52 (2026-10-06): Request bodies keep a minimum pace.** `stream::PacedBody` wraps every route: a body idle
   past `body_idle_timeout`, or under `min_body_bytes_per_second` over `body_rate_window`, ends the request, so
   trickled bodies cannot hold request slots. The clock starts at the handler's first read.
-
-- **D53 (2026-10-06): `none` mode may bind a non-loopback address behind an authenticating front.**
-  `server.auth.unauthenticated_public_bind` is for a deployment whose front authenticates every request and
-  names the user in `X-Walgit-Principal` (already honoured in `none` mode); that name is the push author in
-  the log and the principal policy rules see. The front must overwrite the header on every request: walgit
-  trusts whatever arrives. No other auth path changes.
 
 - **D54 (2026-10-07): Azure conditional writes are sent once, and listings skip directories.** A conditional
   write (`If-Match`/`If-None-Match` upload, block list commit or delete) goes through a client without SDK retries:

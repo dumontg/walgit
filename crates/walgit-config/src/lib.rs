@@ -162,11 +162,6 @@ pub enum Role {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub mode: AuthMode,
-    /// `none` mode on a non-loopback `server.listen`: only behind a front that
-    /// authenticates every request and names the user in `X-Walgit-Principal`, which
-    /// walgit then records as the author of each push (the first push creates the
-    /// repository).
-    pub unauthenticated_public_bind: bool,
     /// Allow unauthenticated read (upload-pack, LFS, web UI) when mode != none.
     pub anonymous_read: bool,
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
@@ -949,7 +944,6 @@ impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             mode: AuthMode::None,
-            unauthenticated_public_bind: false,
             anonymous_read: true,
             tokens: vec![],
             issuer: String::new(),
@@ -1319,8 +1313,8 @@ impl Config {
         let a = &self.server.auth;
         if a.mode == AuthMode::None {
             anyhow::ensure!(
-                self.server.listen.ip().is_loopback() || a.unauthenticated_public_bind,
-                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind, or set server.auth.unauthenticated_public_bind behind an authenticating front",
+                self.server.listen.ip().is_loopback(),
+                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
                 self.server.listen
             );
         }
@@ -1830,12 +1824,6 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
-        // ... unless the deployment says a front authenticates (D53).
-        let fronted = Config::parse(
-            "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\nunauthenticated_public_bind = true\n",
-        )
-        .unwrap();
-        assert!(fronted.server.auth.unauthenticated_public_bind);
         // The issuer is an oidc-only requirement: none and token mode validate without one.
         let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
         assert_eq!(none.server.auth.issuer, "");
