@@ -127,7 +127,15 @@ impl AzureStore {
         } else {
             Some(credential(cfg.azure.credential)?)
         };
-        Self::with_client_options(cfg, url, credential, ClientOptions::default())
+        // Reads follow `store.max_retries`; conditional writes never retry (see `mutations`).
+        let options = ClientOptions {
+            retry: RetryOptions::exponential(azure_core::http::ExponentialRetryOptions {
+                max_retries: cfg.max_retries,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Self::with_client_options(cfg, url, credential, options)
     }
 
     fn with_client_options(
