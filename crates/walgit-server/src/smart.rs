@@ -18,7 +18,9 @@ use crate::repo::RepoRoute;
 use crate::stream::{VecWriter, body_to_async_read, maybe_gunzip, write_body_pipe};
 use tracing::Instrument;
 
-const MAX_OBJECT_INFO_OIDS: usize = 1024;
+/// git's own client sends up to 10,000 object ids per request (`cat-file`
+/// remote-object-info); the protocol cannot advertise a smaller limit.
+const MAX_OBJECT_INFO_OIDS: usize = 10_000;
 /// Remote pack header reads one object-info request may have in flight.
 const OBJECT_INFO_PARALLEL_READS: usize = 16;
 

@@ -213,18 +213,18 @@ async fn object_info_v2_bounds_oid_count_before_sync() -> TestResult {
     git_in(&src, &["push", "-q", "origin", "main"])?;
     let oid = git_in(&src, &["rev-parse", "main"])?.trim().to_owned();
 
-    let accepted = vec![oid.clone(); 1024];
+    let accepted = vec![oid.clone(); 10_000];
     let response = request_object_info(&server, "t", "object-info-limit", &accepted).await?;
     assert!(response.status().is_success());
     let body = response.bytes().await?;
     assert!(!String::from_utf8_lossy(&body).contains("ERR "));
 
-    let refused = vec![oid; 1025];
+    let refused = vec![oid; 10_001];
     let response = request_object_info(&server, "t", "object-info-limit", &refused).await?;
     assert!(response.status().is_success());
     let body = response.text().await?;
     assert!(
-        body.contains("ERR walgit: object-info request has 1025 object ids"),
+        body.contains("ERR walgit: object-info request has 10001 object ids"),
         "{body}"
     );
     let tasks = server
