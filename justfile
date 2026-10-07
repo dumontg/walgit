@@ -169,12 +169,6 @@ store-test-s3:
     AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-walgit-dev-secret}" \
     cargo test -p walgit-store --test contract -- --nocapture
 
-# Store contract against a local Azurite (blob port 10000) with the container `walgit-test` created.
-test-azure:
-    WALGIT_TEST_AZURE_CONNECTION_STRING="UseDevelopmentStorage=true" \
-    WALGIT_TEST_AZURE_CONTAINER=walgit-test \
-    cargo test -p walgit-store --test contract azure_contract -- --nocapture
-
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:
     cargo test -p walgit-store

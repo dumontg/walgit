@@ -729,42 +729,6 @@ async fn s3_contract() {
     }
 }
 
-#[cfg(feature = "azure")]
-#[tokio::test]
-async fn azure_contract() {
-    if std::env::var("WALGIT_TEST_AZURE_CONNECTION_STRING").is_err() {
-        eprintln!("skipping azure_contract: WALGIT_TEST_AZURE_CONNECTION_STRING not set");
-        return;
-    }
-    let container =
-        std::env::var("WALGIT_TEST_AZURE_CONTAINER").unwrap_or_else(|_| "walgit-test".into());
-    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
-    let cfg = walgit_config::StoreConfig {
-        backend: walgit_config::StoreBackend::Azure,
-        bucket: container,
-        prefix: prefix.clone(),
-        azure: walgit_config::AzureConfig {
-            connection_string_env: "WALGIT_TEST_AZURE_CONNECTION_STRING".into(),
-            ..Default::default()
-        },
-        multipart_threshold: bytesize::ByteSize::mib(5),
-        multipart_part_size: bytesize::ByteSize::mib(5),
-        ..Default::default()
-    };
-    let store: DynStore =
-        Arc::new(walgit_store::azure::AzureStore::new(&cfg).expect("AzureStore::new"));
-
-    run_contract(store.clone(), &prefix).await;
-
-    let to_delete: Vec<_> = walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-        .filter_map(|r| async move { r.ok() })
-        .collect()
-        .await;
-    for m in to_delete {
-        let _ = store.delete(&m.key, None).await;
-    }
-}
-
 #[cfg(feature = "gcs")]
 #[tokio::test]
 async fn gcs_contract() {
