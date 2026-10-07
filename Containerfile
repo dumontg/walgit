@@ -32,9 +32,11 @@ COPY crates ./crates
 COPY --from=web /src/web/dist ./web/dist
 ARG WALGIT_BUILD_SHA=dev
 ENV WALGIT_BUILD_SHA=${WALGIT_BUILD_SHA}
+# Optional cargo features, e.g. --build-arg CARGO_FEATURES=walgit-store/azure for the Azure backend.
+ARG CARGO_FEATURES=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p walgit-cli \
+    cargo build --release --locked -p walgit-cli ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
     && install -D target/release/walgit /out/bin/walgit \
     && install -D target/release/walgit-server /out/bin/walgit-server
 
